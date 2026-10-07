@@ -11,15 +11,16 @@
 - 通路：IMX582 → CSI-2 port 2 → SENINF intf 4（SENINF_5）→ SENINF mux 1（`0x1a011d00` SRC_SEL=8）→ CAM_MUX 3（`0x1a010460`）→ `camsv1@1a110000` IMGO DMA → V4L2 `/dev/video0`（YUYV 422）
 - 关键约束：`DBL_DATA_BUS=2 + PAK_DBL=2 + PAK_MODE=0x82` 三件套同时成立才配对；抓帧缓冲必须是 4096 对齐（否则 IOMMU `min_pagesz 0x1000` 映射失败、出黑帧）；CAMSV 在 larb0 后面，只能走 IOVA，用 `dma_alloc_coherent` 拿 CMA + IOMMU 映射
 
-## 当前状态（2026-10-07）
+## 当前状态（2026-10-08）
 
 - 采集通路打通，V4L2 出 YUYV 流，Cheese 可用
-- 帧率：preview 表 + VTS `0x0CE4`(3300) ⇒ 上限 ~33.5 fps，实测 32–33 fps（转换线程 4）
-- 全尺寸输出：`v4l2_bin=1` 时输出原生分辨率（1080p 不再缩到 960×540），1080p 90+ fps、4000×2256 22 fps、4000×3000 19 fps（受转换耗时限制）
+- 帧率：preview 表 + VTS `0x0CE4`(3300) ⇒ 上限 ~33.5 fps，实测 32–33 fps（转换线程 8）
+- 全尺寸输出：`v4l2_bin=1` 时输出原生分辨率（1080p 不再缩到 960×540），1080p 112 fps、4000×2256 48 fps（受转换耗时限制）
 - 颜色：CFA = RGGB（物理实验 + 厂商 `.sensor_output_dataformat = SENSOR_OUTPUT_FORMAT_RAW_4CELL_HW_BAYER_R` 双重确认）；红蓝错位的真因是 YUYV 色度字节序（byte1=Cb、byte3=Cr），Bayer 标签交换在灰世界 AWB 下不可见
 - 曝光/白平衡：对数半步 + IIR 的 AE 环（不闪烁）、灰世界 AWB
 - 对焦：DW9800V 开环 + 对比度爬山搜索（V4L2 `focus_absolute` / `focus_automatic_continuous`）
 - 运行期切模式：驱动自带 5 张传感器模式表，`VIDIOC_S_FMT` 换分辨率、`S_PARM` 换帧率，`/proc/camcap` 也能切（见下）
+- 可复现构建：内核 tag `k50-camera-base` + `scripts/reproduce_build.sh`，复现出的 `srcversion` 与出厂一致（见「可复现构建」）
 - 已知边界：mainline 上没有可用的 MTK ISP（厂商 `mtk-cam-isp.ko` 无法加载，ISP 由 CCU 固件 / TEE 驱动），所以去马赛克、AE/AWB/AF 全部在 CPU 侧完成；滚动快门是传感器读出时间的物理事实，只能用低读出模式缓解（1080p 约 4 ms，4000×3000 约 27 ms）
 
 ## 传感器模式表（IMX582，本机实测寄存器）
@@ -76,11 +77,19 @@ v4l2-ctl -d /dev/video0 --set-parm=60                 # 换帧率（→ custom3�
 
 | 模式 | 输出 | 描述符 | 实测（avg / timing） | 受限点 |
 | --- | --- | --- | --- | --- |
-| preview（bin 2） | 2000×1500 | 33.26 fps | 33.4 / 33.3 | 传感器 VTS |
-| custom2（bin 1） | 1920×1080 | 120.09 fps | 86.7 / 76.1 | 转换 |
-| custom3（bin 1） | 4000×2256 | 60.02 fps | 39.5 / 43.2 | 转换 |
-| hs_video（bin 1） | 1920×1080 | 240.05 fps | 93.0 / 85.3 | 转换 |
-| normal_video（bin 1） | 4000×2256 | 30.00 fps | 28.5 / 29.9 | 传感器 |
+| preview（bin 2） | 2000×1500 | 33.26 fps | 33.8 / 33.4 | 传感器 VTS |
+| custom2（bin 1） | 1920×1080 | 120.09 fps | 112.7 / 103.4 | 转换 |
+| custom2（bin 2） | 960×540 | 120.09 fps | 120.3 / 120.6 | 打满 |
+| custom3（bin 2） | 2000×1128 | 60.02 fps | 60.3 / 59.6 | 打满 |
+| custom3（bin 1） | 4000×2256 | 60.02 fps | 48.5 / 58.9 | 转换 |
+| normal_video（bin 1） | 4000×2256 | 30.00 fps | 29.8 / 29.9 | 传感器 |
+| hs_video（bin 1） | 1920×1080 | 240.05 fps | 96.8 / 247.4 | 转换 |
+
+（默认 `conv_threads=8`、`pipe_slots=3`；上面是模块**只用默认参数**加载时的实测值，全部 rc=0、崩溃 0。）
+
+一帧的转换是串行工序（一个 `cam_cap_conv` 线程取槽、再分给 8 个 worker），所以帧周期约
+`conv + P/N`（P = 帧周期，N = `pipe_slots`）。加槽只消等槽时间、不加吞吐：第 4 个槽和 6 线程都更差。
+因此**要 60/120 fps 的实用路数是 bin 2 半尺寸**（原生 4K60 目前 48.5 fps，还差约 20%）。
 
 两个和切换有关的坑，记在这里以免再踩：
 
@@ -95,7 +104,7 @@ v4l2-ctl -d /dev/video0 --set-parm=60                 # 换帧率（→ custom3�
 
 | 路径 | 内容 |
 | --- | --- |
-| `src/cam_cap.c` | 唯一驱动：CAMSV 采集 + V4L2/videobuf2 + `/proc/camcap` + AE/AWB/AF + 双缓冲流水线 + 2×2/全尺寸转换器 + 运行期模式切换 |
+| `src/cam_cap.c` | 唯一驱动：CAMSV 采集 + V4L2/videobuf2 + `/proc/camcap` + AE/AWB/AF + 三槽流水线 + 2×2/全尺寸转换器 + 运行期模式切换 |
 | `src/imx582_modes.h` | 生成的 5 张模式表 + 模式描述符（含 MIPI 速率、VTS、曝光上限），由 `scripts/gen_modes_header.py` 生成 |
 | `src/imx586*.c`、`src/rubensimx582_Sensor.h`、`src/sensor_list.c` | 厂商 IMX586/IMX582 传感器表与参考实现（来源见下） |
 | `src/cam_*.c`、`src/mod_*.c`、`src/Makefile` | 相机供电/时钟/GPIO/overlay 等配套 out-of-tree 模块 |
@@ -104,6 +113,7 @@ v4l2-ctl -d /dev/video0 --set-parm=60                 # 换帧率（→ custom3�
 | `docs/SENINF_CONFIG.md`、`docs/seninf_routing.md` | SENINF/CAM_MUX 路由与寄存器 |
 | `docs/camsv_*.md` | CAMSV 寄存器序列/帧参数逆向 |
 | `docs/CAMERA_CAPTURE_WORKING.md`、`docs/ISP_FEASIBILITY.md` | 采集可用状态、ISP 可行性结论 |
+| `docs/REPRODUCIBLE_BUILD.md` | 复现构建配方与 `srcversion` 取证 |
 | `scripts/` | bring-up / 测速 / 模式切换 / 对焦标定 / 转换器等价性验证脚本 |
 | `modes/` | 7 个模式的寄存器表（`0xREG 0xVAL` 文本） |
 | `docs/k50_mainline_config.gz` | 构建该模块用的内核配置 |
@@ -134,12 +144,31 @@ ARCH=arm64 LLVM=1 make -C $K M=$SRC modules
 ## 加载
 
 ```sh
-insmod cam_cap.ko v4l2_enable=1 conv_threads=4 pipeline=1
+insmod cam_cap.ko v4l2_enable=1 pipe_slots=3 pipeline=1      # conv_threads 默认已是 8
 ```
 
-常用参数：`v4l2_enable`（开 V4L2 节点）、`v4l2_bin`（1 = 全尺寸转换器 + 原生输出，2 = 2×2 出半尺寸）、`v4l2_full_cache`（1 = 每行只解包一次）、`exp_hsize/exp_vsize/v4l2_src_stride`（运行期几何）、`exp_max`（曝光上限，必须 < VTS）、`out_width/out_height`、`wb_r_q8/wb_b_q8`（AWB 初值）、`rb_swap`、`pipeline`、`conv_threads`、`ae_enable/awb_enable/af_enable`、`mode_trace`（逐条打印模式表写入并回读校验）、`rx_rate`（速率变化时重定时 CSI 接收端，默认开）、`mode_init_replay`（切模式时重放 power-on 表，默认开）、`dphy_base`。
+常用参数：`v4l2_enable`（开 V4L2 节点）、`v4l2_bin`（1 = 全尺寸转换器 + 原生输出，2 = 2×2 出半尺寸）、`v4l2_full_cache`（1 = 每行只解包一次）、`exp_hsize/exp_vsize/v4l2_src_stride`（运行期几何）、`exp_max`（曝光上限，必须 < VTS）、`out_width/out_height`、`wb_r_q8/wb_b_q8`（AWB 初值）、`rb_swap`、`pipeline`、`pipe_slots`（流水线槽数，2–4，默认 3）、`conv_threads`（转换 worker 数，默认 8）、`ae_enable/awb_enable/af_enable`、`mode_trace`（逐条打印模式表写入并回读校验）、`rx_rate`（速率变化时重定时 CSI 接收端，默认开）、`mode_init_replay`（切模式时重放 power-on 表，默认开）、`dphy_base`。
 
 `/proc/camcap` 命令：`modes`（列模式）、`mode <name> [bin]`（切模式）、`stats`/`regs`/`af …`/`cfg …`/`arm`/`route`/`reroute`/`stop`/`burst`/`probe`（诊断）。
+
+## 可复现构建
+
+别人 clone 这个仓库能不能编出同一份模块？**能，而且可以取证**：出厂模块的
+`srcversion` 是 `493F61FF760E440C2CC5AA7`、`vermagic` 是 `7.2.0-g0b8dd2e87b3d-dirty SMP preempt mod_unload aarch64`，
+本仓库的一键脚本能在干净环境里复现出相同的 `srcversion`/`vermagic`。
+
+```sh
+sh scripts/reproduce_build.sh          # 默认用内核 tag k50-camera-base
+```
+
+脚本自己会：clone 内核（`KERNEL_REPO`/`KERNEL_REF` 可覆盖，默认 public 仓的 `k50-camera-base` tag）→
+给 `CREDITS` 追加一行脏标记（复现 vermagic 里的 `-dirty`）→ 用 `docs/k50_mainline_config.gz` 当 `.config`
+→ `olddefconfig` → **只需 `modules_prepare`，不必完整编内核**（配置里 `# CONFIG_MODVERSIONS is not set`、
+`# CONFIG_MODULE_SIG is not set`）→ 调 `scripts/z_build_camcap.sh` 出 `cam_cap.ko`。
+
+配方、取证方法与"什么一致、什么不一致"见 [docs/REPRODUCIBLE_BUILD.md](docs/REPRODUCIBLE_BUILD.md)；
+实测复现产物大小 915 600 B（出厂 909 216 B），`srcversion` 与 `vermagic` 完全相同，md5 不同只因为
+字节里含构建路径。工具链是 Ubuntu clang/ld.lld 18.1.3 + GNU Make 4.3。
 
 ## 来源与许可
 

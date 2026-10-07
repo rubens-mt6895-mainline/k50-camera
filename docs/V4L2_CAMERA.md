@@ -1084,5 +1084,91 @@ custom3/hs_video = **1964 Mbps**。逐字段看完那份序列后，**只有两�
 | `scripts/zz_restore.sh`（新） | 把设备放回默认配置（preview bin2 2000×1500） |
 | `scripts/zz_modechk.sh`（新） | `/proc` `mode` 命令的三个探针，定位过一个解析 bug（`sscanf` 返回 2 被 `== 1` 误判成参数错误） |
 
+## 16. 2026-10-08 凌晨 VIII：**转换器优化 + 三槽流水线 + 帧率账本 + 可复现构建**
+
+§15 的模式切换已经能用，但每个高帧率档都是"转换受限"。这一节把转换做快一轮，并且回答"别人 clone
+了仓库能不能编出同版本"。
+
+### 16.1 结果（真机，只用模块默认参数：`conv_threads=8`、`pipe_slots=3`、`v4l2_bin=2`）
+
+| 模式（传感器表） | 输出 | 描述符 | 实测 avg fps | timing fps | 判定 |
+|---|---|---|---|---|---|
+| preview 4000×3000 | 2000×1500（bin2） | 33.26 | **33.84** | 33.38 | 传感器/VTS 天花板，打满 |
+| custom2 1920×1080 | 1920×1080 原生 | 120.09 | **112.74** | 103.36 | 94% |
+| custom2 1920×1080 | 960×540（bin2） | 120.09 | **120.34** | 120.59 | 打满 |
+| custom3 4000×2256 | 2000×1128（bin2） | 60.02 | **60.34** | 59.61 | 打满 |
+| custom3 4000×2256 | 4000×2256 原生 | 60.02 | **48.52** | 58.86 | 81%，转换受限 |
+| normal_video 4000×2256 | 4000×2256 原生 | 30.00 | **29.76** | 29.92 | 传感器上限，打满 |
+| hs_video 1920×1080 | 1920×1080 原生 | 240.05 | 96.83 | 247.37 | 转换受限（用户已决定不做 240） |
+
+`--list-formats-ext` 现在给出六个离散尺寸与区间：4000×3000 / 2000×1500 = 33.260；4000×2256 /
+2000×1128 = 30.000 与 60.020；1920×1080 / 960×540 = 120.090 与 240.050。全部 rc=0、崩溃 0。
+
+### 16.2 优化了什么（三处，都不改画面语义）
+
+1. **色度矩阵每对像素只做一次**：YUYV 的 U/V 本来就是两个像素共用的。旧代码对两个像素各算一遍再
+   平均；新代码先把同一色调映射后的 tap 相加（`ar = a0 + a1` …），再做一次矩阵 `>>9`。颜色矩阵是
+   线性的 ⇒ 两者只差 ≤1 LSB，`scripts/check_yuyv_chroma.py` 用真实色调表在 78 408 对上验证：
+   亮度逐位相同，色度最坏差 1 LSB。
+2. **行首尾 padding，去掉内层循环的三个条件分支**：每行解包到 `out[1..n]`（新增
+   `cam_unpack_row_pad()`，两端复制邻居），`xm` / `xp` / `xpp` 的条件选择全部消失。
+3. **该对象单独 `-O3`**（`CFLAGS_cam_cap.o := -O3`），默认 `conv_threads` 4 → **8**（worker 都
+   nice 10，不会饿死桌面）。
+
+合计：1080p 转换 11.9 → 6.5–7.9 ms（帧率 83 → 112 fps），4000×2256 19.5 → 15.2 ms（37 → 48.5 fps）。
+
+### 16.3 三槽流水线：`period ≈ conv + P/N`
+
+`pipe_slots` 默认从 2 改为 3，每帧消掉一份 `P/N` 的等槽时间：
+
+| 配置 | 1080p120 | 4000×2256@60 |
+|---|---|---|
+| 2 槽（旧） | 83.3 | 37.3 |
+| **3 槽（默认）** | **112.7** | **48.5** |
+| 4 槽 | 110.7（更差） | 46.1（更差） |
+| 3 槽 + 6 线程 | 88.0 | 40.4 |
+
+⇒ 一帧的转换是**串行**的一道工序（一个 `cam_cap_conv` 线程取槽，再分给 8 个 worker），所以
+`period ≈ conv + P/N`；加槽只消等待、不加吞吐，第 4 个槽因为 CMA/缓存压力反而更差。打满的条件是
+`conv ≤ P − P/N`：1080p（P = 8.33 ms）要 conv ≤ 5.6 ms，4000×2256（P = 16.7 ms）要 ≤ 11.1 ms。
+
+### 16.4 为什么原生 4K60 还差一点，而半尺寸轻松打满
+
+4000×2256 = 9.02 Mpx，8 线程下转换 15.2 ms（≈1.7 ns/px）；`custom3` 的 bin=2 半尺寸只有 2.26 Mpx
+⇒ 约 3.8 ms，远低于 16.7 ms 的帧周期。所以：
+
+- **要 60 fps 的实用路数是 bin=2 半尺寸（2000×1128）**，实测 60.34 fps；
+- 原生 4000×2256@60 目前 48.5 fps（81%），要补满还得让转换再快约 20%；
+- 用户态拷贝不是瓶颈：4/8/12 个 mmap 缓冲、带不带 `--stream-to` 都是 48–51.5 fps；设备日志里是
+  `convert: 8 workers, 282 rows each`，且**没有**任何 `worker stalled` 告警，worker 确实并行。
+
+### 16.5 可复现构建（别人 clone 仓库能编出同版本吗）
+
+**能，而且可以取证。** 三件事：
+
+1. 模块必须匹配的那个内核提交原本**不在任何公开 ref 上**（对象在 GitHub 服务器上，但 clean clone
+   按名字取不到），现在已经打成**附注 tag `k50-camera-base`**（tag 对象 `5087eada53f0` → commit
+   `0b8dd2e87b3d`）推到公开内核仓 `rubens-mt6895-mainline/linux`。
+2. 出厂模块的指纹：`srcversion: 493F61FF760E440C2CC5AA7`、`vermagic: 7.2.0-g0b8dd2e87b3d-dirty
+   SMP preempt mod_unload aarch64`。
+3. 一键脚本 `scripts/reproduce_build.sh` + 文档 `docs/REPRODUCIBLE_BUILD.md`：clone 那个 tag →
+   给 `CREDITS` 追加一行脏标记（复现 `-dirty`）→ 用 `docs/k50_mainline_config.gz` 当 `.config` →
+   `olddefconfig` → **只需 `modules_prepare`，不必完整编内核**（配置里
+   `# CONFIG_MODVERSIONS is not set`、`# CONFIG_MODULE_SIG is not set`）→ `z_build_camcap.sh`。
+
+端到端实测：复现构建 915 600 B，**srcversion 与出厂完全相同**（md5 不同，差在构建路径相关字节），
+vermagic 相同 ⇒ 代码同一、可直接加载。剩下的差异只有构建机路径，不影响功能。
+
+### 16.6 本节新增/更新
+
+| 文件 | 作用 |
+|---|---|
+| `src/cam_cap.c` | 色度/矩阵每对一次、`cam_unpack_row_pad()`、内层去分支、`pipe_slots=3`、`conv_threads=8`；`.ko` **909 216 B** |
+| `scripts/check_yuyv_chroma.py`（新） | 证明"色度每对一次"与"逐像素平均"只差 ≤1 LSB |
+| `scripts/zz_b60.sh` / `zz_ct4.sh` / `zz_accept.sh`（新） | 半尺寸矩阵 / 线程与槽数扫描 / 默认参数最终验收 |
+| `scripts/reproduce_build.sh`（新） | 一键复现构建（面向仓库，不依赖本机环境） |
+| `docs/REPRODUCIBLE_BUILD.md`（新） | 复现配方与 `srcversion` 取证 |
+| `scripts/z_build_camcap.sh` | 生成的 Makefile 加 `CFLAGS_cam_cap.o := -O3` |
+
 
 

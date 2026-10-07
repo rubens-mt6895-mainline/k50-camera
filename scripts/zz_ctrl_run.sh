@@ -18,7 +18,7 @@ timeout 60 scp $OPTS "${K50_REPO}/scripts/$S" "$H:/root/$S" >/dev/null 2>&1
 echo "scp $S rc=$?"
 # The sensor bring-up lives in python + shell helpers; push them too so a local
 # edit to the mode table (e.g. VTS) actually reaches the device.
-for f in imx582_bring.py port2_rx71.py zz_v80.sh zz_cam_up.sh zz_mode.sh zz_full.sh zz_full2.sh zz_framecmp.py zz_vts1.sh zz_vtscan.sh zz_ylines.sh zz_who.sh zz_af_up.sh zz_af_sweep.sh zz_af_auto.sh zz_af_check.sh zz_af_wobble.sh zz_af_rate.sh zz_shutdown.sh zz_offlog.sh; do
+for f in imx582_bring.py port2_rx71.py zz_v80.sh zz_cam_up.sh zz_mode.sh zz_full.sh zz_full2.sh zz_framecmp.py zz_vts1.sh zz_vtscan.sh zz_ylines.sh zz_who.sh zz_af_up.sh zz_af_sweep.sh zz_af_auto.sh zz_af_check.sh zz_af_wobble.sh zz_af_rate.sh zz_shutdown.sh zz_offlog.sh zz_sfmt.sh zz_sfmt_perf.sh zz_restore.sh zz_modechk.sh zz_sw_test.sh zz_c3.sh zz_b60.sh zz_ct4.sh zz_accept.sh; do
 	if [ -f "${K50_REPO}/scripts/$f" ]; then
 		sed -i 's/\r$//' "${K50_REPO}/scripts/$f"
 		timeout 60 scp $OPTS "${K50_REPO}/scripts/$f" "$H:/root/$f" >/dev/null 2>&1

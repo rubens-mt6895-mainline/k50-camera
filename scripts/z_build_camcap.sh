@@ -33,6 +33,9 @@ cp "$SRC/imx582_modes.h" imx582_modes.h || exit 1
 
 cat > Makefile <<'EOF'
 obj-m := cam_cap.o
+# The converters are the frame-rate ceiling (see docs/V4L2_CAMERA.md 15.7): let
+# clang optimise this one object harder than the kernel default -O2.
+CFLAGS_cam_cap.o := -O3
 EOF
 
 echo "=== kernel tree ==="

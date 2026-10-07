@@ -1509,5 +1509,35 @@ else if (elapsed < 20000000LL)
 
 细节（代码位置、模式表字段、验收脚本）见 [docs/V4L2_CAMERA.md](V4L2_CAMERA.md) §15。
 
+## 19. ★★★ 2026-10-08 凌晨 VIII：**转换提速一轮 + 三槽流水线 + 可复现构建**
+
+§18 的结论是"高帧率档全是转换受限"。这节把转换做快一轮，并把"别人 clone 仓库能不能编出同版本"
+落成可取证的东西。
+
+**优化三处（都不改画面语义）**：① 色度矩阵每对像素只算一次（YUYV 的 U/V 本就共用；矩阵线性 ⇒
+与逐像素平均只差 ≤1 LSB，`scripts/check_yuyv_chroma.py` 在 78 408 对上验证）；② 每行解包加首尾
+padding（`cam_unpack_row_pad()`），内层循环的 `xm/xp/xpp` 条件分支全消失；③ 该对象单独 `-O3`，
+默认 `conv_threads` 4 → 8（worker nice 10）。
+
+**三槽流水线**：`pipe_slots` 默认 2 → 3。一帧的转换是**串行**工序（一个 `cam_cap_conv` 线程取槽再
+分给 8 个 worker），所以 `period ≈ conv + P/N`：加槽只消等槽时间、不加吞吐，第 4 个槽反而更差
+（CMA/缓存压力），6 线程也更差。8 线程 + 3 槽是定案。
+
+**实测（只用默认参数）**：preview bin2 2000×1500 **33.84 fps**（天花板）；custom2 原生 1920×1080
+**112.74 fps**（描述符 120）；custom2 半尺寸 960×540 **120.34**（打满）；custom3 半尺寸 2000×1128
+**60.34**（打满 60）；custom3 原生 4000×2256 **48.52**（描述符 60，仍差 19%）；normal_video 原生
+4000×2256 **29.76**（传感器 30 上限）；hs_video **96.83**。用户态拷贝不是瓶颈（4/8/12 缓冲、
+带不带 `--stream-to` 都 48–51.5 fps），worker 日志证明 8 个都在跑。
+
+**可复现构建**：模块匹配的内核提交原本**不在任何公开 ref 上** ⇒ 已打成附注 tag
+`k50-camera-base`（tag 对象 `5087eada53f0` → commit `0b8dd2e87b3d`）推到公开内核仓。出厂模块指纹
+`srcversion: 493F61FF760E440C2CC5AA7`、`vermagic: 7.2.0-g0b8dd2e87b3d-dirty …`。配方 = clone 该
+tag → 给 `CREDITS` 追加脏标记 → 用 `docs/k50_mainline_config.gz` 当 `.config` → `olddefconfig` →
+**只要 `modules_prepare`** → `z_build_camcap.sh`；一键脚本 `scripts/reproduce_build.sh`、文档
+[docs/REPRODUCIBLE_BUILD.md](REPRODUCIBLE_BUILD.md)。端到端实测复现产物 srcversion 与出厂**相同**
+（md5 差在构建路径字节）⇒ 代码同一、可加载。
+
+细节见 [docs/V4L2_CAMERA.md](V4L2_CAMERA.md) §16。
+
 
 
