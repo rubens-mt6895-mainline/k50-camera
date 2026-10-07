@@ -171,7 +171,7 @@
 ### 外场执行路径（设备在外场期间）
 设备在外场时的执行路径（${K50_REPO}
 emote\ 三个脚本）：
-1. **step1-phone-setup.sh**（手机触摸屏手打 3 行）：root 临时密码 REDACTED-TEMP-SSH + 开 SSH 密码登录 + 打印 IP。
+1. **step1-phone-setup.sh**（手机触摸屏手打 3 行）：root 临时密码 k50out + 开 SSH 密码登录 + 打印 IP。
 2. 外场电脑 `ssh root@<手机IP>`（同网络/热点）→ 整段粘贴 **step2-fingerprint-relay.sh**：dd 补丁 goodixfp.ta 的两个门（文件偏移 235916/235932 写 NOP 1f2003d5，先校验原始字节 e0220035/c20e0054）→ 跑 enroll 20 → 抓关键结果。**v40 补丁等价实现，无需传输二进制！**
 3. **step3-camera-relay.sh**：只读检查（电源轨保持？MCLK/RST 引脚状态？总线扫描）。相机完整上电仍缺 cam_pwr.ko 传输：若手机有外网，可走 GitHub 中转（ta_host/cam_pwr.ko 均为自有代码，无固件内容）。
 修复回滚：`cp /opt/goodixta/ta/goodixfp.ta.orig /opt/goodixta/ta/goodixfp.ta`。
@@ -1483,6 +1483,31 @@ else if (elapsed < 20000000LL)
 ⇒ 暗光噪声 vs 果冻，正是 S_FMT 该暴露的旋钮。
 
 细节（含四条修改的代码位置、扫描表、脚本清单）见 [docs/V4L2_CAMERA.md](V4L2_CAMERA.md) §14。
+
+## 18. ★★★ 2026-10-07 晚 VII：**运行期切模式**（`S_FMT`/`S_PARM` + `/proc/camcap mode`）
+
+§17 把果冻的修法指到"换低读出模式"，这节让它变成应用能调的接口：模块自带 5 张传感器模式表。
+
+**实测（两条入口，全部 rc=0、崩溃 0）**：preview bin2 2000×1500 **33.43 fps**；`/proc` `mode custom2 1`
+→ 1920×1080 **86.72 fps**（描述符 120）；`S_PARM 60` → custom3 4000×2256 **39.48 fps**（描述符 60）；
+`S_FMT`+`S_PARM 240` → hs_video 1920×1080 **93.00 fps**（描述符 240）；`S_FMT` → normal_video
+4000×2256 **28.53 fps**（传感器 30 上限）；切回 preview 33.30 fps。传感器寄存器每一步都验证过
+（`0x0307` / VTS 与用户态 bring-up 完全一致）。
+
+**★★ 真凶（很贵）**：模式表全是**字节寄存器**（`0x0306`+`0x0307` 是两条独立 pair），而
+`cam_sensor_write16()` 发 4 字节 `[reg_hi,reg_lo,val_hi,val_lo]` ⇒ 多出的前导 `0x00` 被当成"下一个
+寄存器的值"，**每个值都挪到了下一个寄存器**（`0x0306=0x00 0x0307=0x00`、`0x0340=0x00 0x0341=0x00`，
+与实机回读一致）。AE 一直好使，是因为 `0x0202/0x0204/0x020e` 是真的 16 位寄存器。修法 = 新增
+`cam_sensor_write8/read8`（3 字节），模式表与 `0x0100`/VTS 走 8 位口，`write16` 只留给 AE。
+
+**接收端重定时**：`port2_rx71.py` 写死 1370 Mbps，而 custom3/hs_video 是 1964 Mbps；逐字段核对后
+**只有两个值跟速率走**（D-PHY `HS_TRAIL`、CSI2 `DMY_CYCLE`）⇒ 驱动按 `mipi_mbps` 重算
+（1370 ⇒ 13/26，1964 ⇒ 9/13），同速率切换不动接收端。
+
+**还差**：高帧率档全是转换受限（1080p 86–114 fps、4000×2256 39.5 fps），要吃满 240 fps 得让转换
+更快；`custom4` 8000×6000（60 MB/帧）与 `custom5`（非 binning）没收；切模式会中断推流约 200 ms。
+
+细节（代码位置、模式表字段、验收脚本）见 [docs/V4L2_CAMERA.md](V4L2_CAMERA.md) §15。
 
 
 

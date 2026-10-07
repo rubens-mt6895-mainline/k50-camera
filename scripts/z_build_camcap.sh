@@ -27,6 +27,9 @@ mkdir -p "$OUT"
 cd "$OUT" || exit 1
 
 cp "$SRC/cam_cap.c" cam_cap.c || exit 1
+# Generated sensor-mode tables (scripts/gen_modes_header.py); the driver
+# includes it by name, so it has to sit next to cam_cap.c.
+cp "$SRC/imx582_modes.h" imx582_modes.h || exit 1
 
 cat > Makefile <<'EOF'
 obj-m := cam_cap.o

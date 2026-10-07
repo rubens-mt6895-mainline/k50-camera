@@ -12,6 +12,11 @@ if [ -n "${P:-}" ]; then
 	cat /proc/$P/stack 2>/dev/null | head -20
 fi
 
+echo "=== holders of /dev/video0 ==="
+fuser -v /dev/video0 2>&1
+echo "=== processes that could hold it ==="
+ps -eo pid,stat,etime,args 2>/dev/null | grep -E 'v4l2-ctl|cheese|gst|cam_cap' | grep -v grep
+
 echo "=== cam_cap / v4l2 threads ==="
 ps -e -o pid,stat,etime,comm 2>/dev/null | grep -E 'cam_cap|v4l2-ctl|COMMAND'
 

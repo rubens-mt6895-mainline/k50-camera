@@ -19,6 +19,7 @@
 - 颜色：CFA = RGGB（物理实验 + 厂商 `.sensor_output_dataformat = SENSOR_OUTPUT_FORMAT_RAW_4CELL_HW_BAYER_R` 双重确认）；红蓝错位的真因是 YUYV 色度字节序（byte1=Cb、byte3=Cr），Bayer 标签交换在灰世界 AWB 下不可见
 - 曝光/白平衡：对数半步 + IIR 的 AE 环（不闪烁）、灰世界 AWB
 - 对焦：DW9800V 开环 + 对比度爬山搜索（V4L2 `focus_absolute` / `focus_automatic_continuous`）
+- 运行期切模式：驱动自带 5 张传感器模式表，`VIDIOC_S_FMT` 换分辨率、`S_PARM` 换帧率，`/proc/camcap` 也能切（见下）
 - 已知边界：mainline 上没有可用的 MTK ISP（厂商 `mtk-cam-isp.ko` 无法加载，ISP 由 CCU 固件 / TEE 驱动），所以去马赛克、AE/AWB/AF 全部在 CPU 侧完成；滚动快门是传感器读出时间的物理事实，只能用低读出模式缓解（1080p 约 4 ms，4000×3000 约 27 ms）
 
 ## 传感器模式表（IMX582，本机实测寄存器）
@@ -53,11 +54,49 @@
 `v4l2_bin=2`（2×2 binning，输出半尺寸，预览用）：preview 输出 2000×1500，32.7 fps。
 8 线程下转换成本约 4.3–4.5 µs / 千输出像素。曝光上限 `exp_max=0x0c64`(3172) 必须低于 VTS，否则帧周期被拉长（曾出现 9 fps）。
 
+## 运行期切模式（`S_FMT` / `S_PARM`）
+
+驱动编译进 5 张模式表（`src/imx582_modes.h`，由 `scripts/gen_modes_header.py` 从 `src/rubensimx582_Sensor.h` 生成），
+insmod 之后不再需要重新加载模块或跑用户态 bring-up 就能换模式。收录：`preview` 4000×3000、
+`normal_video` 4000×2256、`custom3` 4000×2256@60、`custom2` 1920×1080@120、`hs_video` 1920×1080@240。
+不收 `custom4` 8000×6000（60 MB/帧，超 CMA 池）与 `custom5`（非 binning，4-cell CFA 转换器未支持）。
+
+```sh
+# 看驱动程序认得的模式（活动那行标 <- active）
+cat /proc/camcap                    # 或 echo modes > /proc/camcap
+# 直接切（名字 + 可选 bin：1 = 原生分辨率，2 = 2×2 输出半尺寸）
+echo "mode custom2 1" > /proc/camcap
+# 标准 V4L2 应用路径
+v4l2-ctl -d /dev/video0 --list-formats-ext
+v4l2-ctl -d /dev/video0 -v width=4000,height=2256     # 换分辨率（→ normal_video）
+v4l2-ctl -d /dev/video0 --set-parm=60                 # 换帧率（→ custom3）
+```
+
+实测（两条入口，全部 rc=0、崩溃 0）：
+
+| 模式 | 输出 | 描述符 | 实测（avg / timing） | 受限点 |
+| --- | --- | --- | --- | --- |
+| preview（bin 2） | 2000×1500 | 33.26 fps | 33.4 / 33.3 | 传感器 VTS |
+| custom2（bin 1） | 1920×1080 | 120.09 fps | 86.7 / 76.1 | 转换 |
+| custom3（bin 1） | 4000×2256 | 60.02 fps | 39.5 / 43.2 | 转换 |
+| hs_video（bin 1） | 1920×1080 | 240.05 fps | 93.0 / 85.3 | 转换 |
+| normal_video（bin 1） | 4000×2256 | 30.00 fps | 28.5 / 29.9 | 传感器 |
+
+两个和切换有关的坑，记在这里以免再踩：
+
+- 模式表里全是 **8 位寄存器**（`0x0306` 与 `0x0307` 是两条独立 pair）。用 16 位写（4 字节 `[reg_hi,reg_lo,val_hi,val_lo]`）
+  会把多出来的前导 `0x00` 送进下一个寄存器，于是**每个值都挪一格**：`0x0306=0x00 0x0307=0x00`、`0x0340=0x00 0x0341=0x00`。
+  驱动因此分成 `cam_sensor_write8()`（模式表、`0x0100`、VTS）与 `cam_sensor_write16()`（曝光/增益，真 16 位）。
+  切换后 `mode_trace=1` 会逐条打印写入并回读校验。
+- `custom3` / `hs_video` 的 MIPI 速率是 1964 Mbps，其余是 1370 Mbps。CSI 接收端里只有两个值跟速率走
+  （D-PHY `HS_TRAIL`、CSI2 `DMY_CYCLE`），驱动按模式描述符重算（`rx_rate=1`）；不变速率时不动接收端。
+
 ## 目录
 
 | 路径 | 内容 |
 | --- | --- |
-| `src/cam_cap.c` | 唯一驱动：CAMSV 采集 + V4L2/videobuf2 + `/proc/camcap` + AE/AWB/AF + 双缓冲流水线 + 2×2/全尺寸转换器 |
+| `src/cam_cap.c` | 唯一驱动：CAMSV 采集 + V4L2/videobuf2 + `/proc/camcap` + AE/AWB/AF + 双缓冲流水线 + 2×2/全尺寸转换器 + 运行期模式切换 |
+| `src/imx582_modes.h` | 生成的 5 张模式表 + 模式描述符（含 MIPI 速率、VTS、曝光上限），由 `scripts/gen_modes_header.py` 生成 |
 | `src/imx586*.c`、`src/rubensimx582_Sensor.h`、`src/sensor_list.c` | 厂商 IMX586/IMX582 传感器表与参考实现（来源见下） |
 | `src/cam_*.c`、`src/mod_*.c`、`src/Makefile` | 相机供电/时钟/GPIO/overlay 等配套 out-of-tree 模块 |
 | `docs/CAMERA_NOTES.md` | 相机移植全过程记录（最长的一份） |
@@ -98,7 +137,9 @@ ARCH=arm64 LLVM=1 make -C $K M=$SRC modules
 insmod cam_cap.ko v4l2_enable=1 conv_threads=4 pipeline=1
 ```
 
-常用参数：`v4l2_enable`（开 V4L2 节点）、`v4l2_bin`（1 = 全尺寸转换器 + 原生输出，2 = 2×2 出半尺寸）、`v4l2_full_cache`（1 = 每行只解包一次）、`exp_hsize/exp_vsize/v4l2_src_stride`（运行期几何）、`exp_max`（曝光上限，必须 < VTS）、`out_width/out_height`、`wb_r_q8/wb_b_q8`（AWB 初值）、`rb_swap`、`pipeline`、`conv_threads`、`ae_enable/awb_enable/af_enable`。
+常用参数：`v4l2_enable`（开 V4L2 节点）、`v4l2_bin`（1 = 全尺寸转换器 + 原生输出，2 = 2×2 出半尺寸）、`v4l2_full_cache`（1 = 每行只解包一次）、`exp_hsize/exp_vsize/v4l2_src_stride`（运行期几何）、`exp_max`（曝光上限，必须 < VTS）、`out_width/out_height`、`wb_r_q8/wb_b_q8`（AWB 初值）、`rb_swap`、`pipeline`、`conv_threads`、`ae_enable/awb_enable/af_enable`、`mode_trace`（逐条打印模式表写入并回读校验）、`rx_rate`（速率变化时重定时 CSI 接收端，默认开）、`mode_init_replay`（切模式时重放 power-on 表，默认开）、`dphy_base`。
+
+`/proc/camcap` 命令：`modes`（列模式）、`mode <name> [bin]`（切模式）、`stats`/`regs`/`af …`/`cfg …`/`arm`/`route`/`reroute`/`stop`/`burst`/`probe`（诊断）。
 
 ## 来源与许可
 

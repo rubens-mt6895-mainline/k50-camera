@@ -989,4 +989,100 @@ V4L2 侧 `focus_absolute`（0..1023）与 `focus_automatic_continuous`（`--list
 `dist clean=132 late=7 slip=12 lost=0`、崩溃 **0**。
 
 
+## 15. 2026-10-07 晚 VII：**运行期切模式**（`VIDIOC_S_FMT` / `S_PARM` + `/proc/camcap mode`）
+
+§14 把果冻的修法指到"换低读出模式"，这节把这件事做成应用能调的接口：一个 insmod 起来
+的模块现在自己带 5 张传感器模式表，`S_FMT` 换分辨率、`S_PARM` 换帧率、`/proc/camcap` 也能切。
+
+### 15.1 结果（真机实测，两条入口，全部 rc=0、崩溃 0）
+
+| 模式 | 入口 | 输出 | 传感器寄存器 | 实测 avg / timing | 描述符 | 受限点 |
+|---|---|---|---|---|---|---|
+| `preview` bin2 | 默认 | 2000×1500 | `0307=0xb4` VTS `0x0CE4` | **33.43 / 33.33** | 33.26 | 传感器（VTS 3300） |
+| `custom2` bin1 | `/proc` `mode custom2 1` | 1920×1080 | `0307=0x99` VTS `0x0834` | **86.72 / 76.11** | 120.09 | 转换（conv 7.2 ms） |
+| `custom3` bin1 | `S_PARM 60` | 4000×2256 | `0307=0x93` VTS `0x0A00` | **39.48 / 43.15** | 60.02 | 转换（conv 17.8 ms > 16.6 ms） |
+| `hs_video` bin1 | `S_FMT` + `S_PARM 240` | 1920×1080 | `0307=0xb4` VTS `0x04D4` | **93.00 / 85.25** | 240.05 | 转换（需 4.16 ms，现约 10.8 ms） |
+| `normal_video` bin1 | `S_FMT` | 4000×2256 | `0307=0xb4` VTS `0x0E4A` | **28.53 / 29.85** | 30.00 | 传感器 |
+
+切回去也正常：`/proc` 写 `mode preview 2` 后仍是 33.30 fps。`--get-fmt-video` 报的
+Bytes per Line 与 `out_width×2` 一致（4000 宽报 8000）。
+
+### 15.2 设计：模式表进驱动，两条入口一座状态机
+
+| 件 | 说明 |
+|---|---|
+| `src/imx582_modes.h` | 由 `scripts/gen_modes_header.py` 从 `src/rubensimx582_Sensor.h` 生成：init 表 112 对 + 5 张模式表各 111 对 + 每模式的描述符（`hsize`/`vsize`/`hts`/`vts`/`vts_table`/`pclk_khz`/`fps_x100`/`mipi_mbps`/`sensor_bin`/`exp_max`） |
+| 收录的模式 | `preview` 4000×3000、`normal_video` 4000×2256、`custom3` 4000×2256@60、`custom2` 1920×1080@120、`hs_video` 1920×1080@240 |
+| 不收的模式 | `custom4` 8000×6000（60 MB/帧，超 CMA）与 `custom5`（非 binning，4-cell CFA 转换器还不支持） |
+| `VIDIOC_S_FMT` | `vb2_is_busy()` 时 `-EBUSY`；否则按当前 bin 再按另一个 bin 匹配目标尺寸，命中就重放表并改 `cam_bin`/`cam_src_*`/`out_*`/曝光上限 |
+| `VIDIOC_S_PARM` | `timeperframe` 的倒数 = 想要的 fps，用来在同尺寸的多张表之间选（1080p 的 120 vs 240、4000×2256 的 30 vs 60） |
+| `enum_framesizes` / `enum_frameintervals` | 5 张表 × bin{1,2} 去重后列出，帧率按 `fps/100` 约分 |
+| `/proc/camcap` | `modes` 列全部表（活动那行标 `<- active`）；`mode <name> [bin]` 直接切（bin 省略=保持当前） |
+
+切换的写序完全照抄用户态 bring-up（`scripts/imx582_bring.py`）的实测节奏：
+`0x0100=0x00` → 等 20 ms → init 表 → 等 20 ms → 模式表 → 写 VTS → 等 50 ms → 需要时给接收端重定时
+→ `0x0100=0x01` → 等 50 ms。
+
+### 15.3 ★ 真凶：模式表是 **8 位寄存器**，16 位写把每个值挪到了下一个寄存器
+
+第一次实机切换时，驱动日志一切正常（`mode: custom2 ...`、`rx: 1370 Mbps/lane ...`），
+传感器却回读出 `0x0306=0x00 0x0307=0x00 0x0340=0x00 0x0341=0x00` 且一个包都不发。
+
+原因：`cam_sensor_write16()` 发的是一条 **4 字节**消息 `[reg_hi, reg_lo, val_hi, val_lo]`，
+而 vendor 模式表全是**字节寄存器**（`0x0306` 和 `0x0307` 是表里两条独立 pair）。多出来的那个
+前导 `val_hi = 0x00` 会被传感器当成"下一个寄存器的值"：
+
+```
+写 w16(0x0306, 0x00)  然后  w16(0x0307, 0xB4)
+  实际落盘： 0x0306=0x00, 0x0307=0x00        ← 0xB4 被挤到 0x0308 去了
+写 w16(0x0340, VTS>>8) 然后 w16(0x0341, VTS&0xff)
+  实际落盘： 0x0340=0x00, 0x0341=0x00
+```
+
+这正好解释了那两次回读，也解释了为什么 **AE 一直好使**：曝光 `0x0202`、模拟增益 `0x0204`、
+数字增益 `0x020e` 是货真价实的 16 位寄存器，`write16` 对它们是对的。
+
+修法：新增 `cam_sensor_write8()`（3 字节 `[reg_hi, reg_lo, val]`）与 `cam_sensor_read8()`
+（2 字节地址写 + `I2C_M_RD` 1 字节读），模式表重放与 `0x0100`/VTS 全走 8 位口；
+`cam_sensor_write16()` 只留给 AE 三件套。加 `mode_trace=1` 可以逐条打印写入并回读校验
+（`0x0100/0x0101/0x0112/0x0114/0x0306/0x0307/0x0340/0x0341`）。
+
+### 15.4 接收端重定时：只有两个字段跟速率走
+
+`scripts/port2_rx71.py`（用户态，移植自 `isp71_ref` 的 `mtk_cam_seninf_set_csi_mipi()`）把速率
+写死成 1370 Mbps，而 IMX582 有两档：preview/normal_video/custom2 = **1370 Mbps**，
+custom3/hs_video = **1964 Mbps**。逐字段看完那份序列后，**只有两个值跟速率有关**：
+
+| 模式 | MIPI Mbps/lane | CSI2 `DMY_CYCLE` | D-PHY `HS_TRAIL` |
+|---|---|---|---|
+| preview / normal_video / custom2 | 1370 | 13 | 26 |
+| custom3 / hs_video | 1964 | 9 | 13 |
+
+驱动现在按 `m->mipi_mbps` 重算这两个值（`cam_rx_set_rate()`，`CAMCAP_SENINF_CK=273 MHz`、
+`cycles = 64×273 MHz / data_rate + 1`、`hs_trail = ⌈(224000/mbps − 68)×273 MHz / 1 GHz⌉`），
+`rx_rate=1` 时只在速率变化时动手；1370 档算出来与 `port2_rx71.py` 写的完全一致，所以同速率
+切换不动接收端。
+
+### 15.5 还差什么（诚实清单）
+
+1. **高帧率档都是转换受限**：1080p 现在 86–114 fps（描述符 120/240 里只跑到这个数的一半到
+   九成），4000×2256 只有 39.5 fps（描述符 60）。要在不降画质的前提下把 240 fps 吃满，得让
+   转换更快（每像素工作量再降，或换更宽的读写路径），光靠线程数已经没用了。
+2. `custom4` 8000×6000（60 MB/帧）和 `custom5`（非 binning）没接：前者超 CMA 池，后者要
+   4-cell CFA 的转换器。
+3. 切模式会短暂中断推流（表重放约 200 ms），应用要自己重开一次 stream。
+
+### 15.6 本节新增/更新
+
+| 文件 | 作用 |
+|---|---|
+| `src/imx582_modes.h`（新，15 996 B） | 生成的模式表 + 描述符（驱动自带，不再依赖用户态 `imx582_bring.py` 才能换模式） |
+| `scripts/gen_modes_header.py`（新） | 从 vendor 头文件生成上表；带 `mipi_mbps` 字段 |
+| `scripts/check_mode_tables.py`（新） | 逐条比对 `src/imx582_modes.h` 与 `modes/mode_*.txt`（证明两条路写的是同一张表） |
+| `src/cam_cap.c` | `cam_sensor_write8/read8`、`cam_mode_match/program/geometry/select`、`cam_mode_write_table`、`cam_mode_verify`、`cam_rx_set_rate`、`S_FMT`/`S_PARM`/`enum_*` 接线；新参数 `dphy_base=0x11c86000` `rx_rate=1` `mode_trace=0` `mode_init_replay=1`；`.ko` **918 640 B** |
+| `scripts/zz_sw_test.sh`（新） | 全部模式两条入口的验收矩阵（streamer 一律 `timeout 25`） |
+| `scripts/zz_restore.sh`（新） | 把设备放回默认配置（preview bin2 2000×1500） |
+| `scripts/zz_modechk.sh`（新） | `/proc` `mode` 命令的三个探针，定位过一个解析 bug（`sscanf` 返回 2 被 `== 1` 误判成参数错误） |
+
+
 
