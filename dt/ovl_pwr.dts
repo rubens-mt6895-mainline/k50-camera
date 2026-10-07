@@ -1,0 +1,43 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Runtime overlay (applied via cam_ovl.ko -> of_overlay_fdt_apply):
+ * bind the 8 camsys clk syscon nodes to their MTCMOS domains.
+ * spm (power-controller@1c001000) live phandle = 0x4d.
+ * Do NOT flash this into dtbo - LK broke on rebuilt dtbo (2026-09-29).
+ */
+/ {
+	fragment@0 {
+		target-path = "/soc@0/syscon@1a000000";
+		__overlay__ { power-domains = <0x4d 0x0c>; };
+	};
+	fragment@1 {
+		target-path = "/soc@0/syscon@1a04f000";
+		__overlay__ { power-domains = <0x4d 0x0e>; };
+	};
+	fragment@2 {
+		target-path = "/soc@0/syscon@1a06f000";
+		__overlay__ { power-domains = <0x4d 0x0e>; };
+	};
+	fragment@3 {
+		target-path = "/soc@0/syscon@1a08f000";
+		__overlay__ { power-domains = <0x4d 0x0f>; };
+	};
+	fragment@4 {
+		target-path = "/soc@0/syscon@1a0af000";
+		__overlay__ { power-domains = <0x4d 0x0f>; };
+	};
+	fragment@5 {
+		target-path = "/soc@0/syscon@1a0cf000";
+		__overlay__ { power-domains = <0x4d 0x10>; };
+	};
+	fragment@6 {
+		target-path = "/soc@0/syscon@1a0ef000";
+		__overlay__ { power-domains = <0x4d 0x10>; };
+	};
+	fragment@7 {
+		target-path = "/soc@0/syscon@1a170000";
+		__overlay__ { power-domains = <0x4d 0x0d>; };
+	};
+};

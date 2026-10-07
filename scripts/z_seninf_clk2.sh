@@ -1,0 +1,4 @@
+#!/bin/bash
+# fetch seninf_top dts node + live clocks from device
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i ~/.ssh/${K50_KEY} root@${K50_HOST} \
+  'echo "=== live seninf node ==="; ls /sys/firmware/devicetree/base/ | grep -iE "seninf|camsys"; echo "---"; for d in /sys/firmware/devicetree/base/*seninf*; do echo "NODE: $d"; cat $d/compatible 2>/dev/null; echo; cat $d/reg 2>/dev/null | od -A x -tx4 | head -3; echo "clocks:"; ls $d/ 2>/dev/null | grep -i clock; done; echo "=== clk debugfs rates ==="; for c in seninf_ck seninf1_ck camtg_ck camtg1_ck camtm_ck cam_m_seninf_con; do echo "--- $c ---"; cat /sys/kernel/debug/clk/$c/clk_rate 2>/dev/null; cat /sys/kernel/debug/clk/$c/clk_enable_count 2>/dev/null; cat /sys/kernel/debug/clk/$c/clk_parent 2>/dev/null; done; echo DONE' 2>&1 | tee ${K50_REPO}/out/seninf_clk2.txt

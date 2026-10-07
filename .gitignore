@@ -1,0 +1,15 @@
+# build products
+*.ko
+*.o
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+__pycache__/
+*.pyc
+# captures
+*.yuyv
+*.raw
+out/
+frames/
