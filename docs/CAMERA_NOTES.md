@@ -1539,5 +1539,61 @@ tag → 给 `CREDITS` 追加脏标记 → 用 `docs/k50_mainline_config.gz` 当 
 
 细节见 [docs/V4L2_CAMERA.md](V4L2_CAMERA.md) §16。
 
+## 20. ★★★ 2026-10-08 凌晨 IX：**四颗相机全部出帧**（CSI 端口参数化 + 微距 I2C overlay）
+
+用户要求"他说四颗摄像头都可以工作，先在我们这复现"。四颗都复现了：
+
+| 相机 | 传感器 | 物理 CSI 口 | SENINF intf | D-PHY_TOP | 输出 | 实测 |
+|---|---|---|---|---|---|---|
+| 主摄 | IMX582 | 2 | 4 | `0x11c86000` | 4000×3000 / 2000×1500 | 33.4 fps（bin2）、原生 4K30 30.2 |
+| 前摄 | IMX596 | 0 | 0 | `0x11c82000` | 2592×1952 | 29.8 fps |
+| 超广角 | S5K4H7 | 1 | 2 | `0x11c92000` | 3264×2448 | 30.2 fps |
+| 微距 | GC02M1 | 3 | 6 | `0x11c96000` | 1600×1200 | 30.2 fps |
+
+**规则**（他们的 `mtk_seninf71*.c` 与 `mt6895.dtsi`）：DT 端口号 = SENINF pad 号，`inputs[i].intf = i`，
+只有偶数端口支持，所以**物理口 N ⇒ intf 2N**；PHY 节点内 = `ANA A +0`、`ANA B +0x1000`、
+`DPHY_TOP +0x2000`、`CPHY_TOP +0x3000`；`TOP_PHY_CTRL_CSI(p) = 0x40 + 4p`、
+`CTRL_BASE(i) = 0x200 + 0x1000i`、`CSI2_BASE(i) = 0xa00 + 0x1000i`。四颗都在 `rubens.dts` 里经
+CAM_MUX 3 汇到同一个 CAMSV（= 我们树的 `camsv1@1a110000`）⇒ 同时只能一颗出流。
+
+**驱动改动只有三处**：新增 `SENINF_TOP_PHY_CTRL_CSI(p)` 宏、route 用 `route_intf / 2`、`cam_rx_set_rate()`
+用 `SENINF_CSI2_BASE(route_intf)` ⇒ `route_intf` + `dphy_base` 两个参数即可覆盖任意端口。
+
+**新增工具**：`scripts/gen_sensor_tables.py`（从他们的驱动抽 `cci_reg_sequence` 表 → `0xREG 0xVAL`）、
+`scripts/sensor_bring.py`（通用重放：8/16 位寄存器、ID 回读、上电时序）、`scripts/csirx_bring.py
+[port] [link_mhz] [秒] [lane 数] [trail_ns]`（按端口算 ANA/DPHY/TOP/CTRL/CSI2 基址 + 重定时值）、
+`zz_front_cap.sh` / `zz_uw2.sh` / `zz_macro_cap.sh` / `zz_macro_grab.sh`。
+
+**微距的坑（我们 DT 里没有 `i2c@11d03000`）**：微距挂 `i2c4`，必须用运行时 overlay 新建控制器
+（`dt/ovl_i2c4.dts` + `src/ovl_i2c4.c` + `z_build_ovl6.sh`）。两颗雷：① FDT 块必须**8 字节对齐**，
+否则 `OF: overlay: Invalid overlay_fdt header`（内核 `fdt_check_header()` 第一件事就查对齐）⇒
+`.incbin` 前加 `.balign 8`；② dtc **不能带 `-@`**，我们的 live DT 没有 `/__symbols__`，否则
+`OF: overlay: symbols in overlay, but not in live tree` ⇒ 去 `-@` 并去掉节点标签；另外模块要自己带
+`module_exit` + `of_overlay_remove`，否则不可卸载。成功后 `/dev/i2c-*` 多一条，`0x37` 回读 `0x02e0`。
+
+**证据**：`cam_mux_chk` 回读的尺寸与几何一致（`0x04b00640` = 1200|1600、`0x09900cc0` = 2448|3264）、
+`frame_ready 1 / last_result 0`、帧率与 HTS×VTS 自洽（微距 2192×1268 @84 MHz = 30.0）；抓到本地渲染
+（微距首帧 `Y 12.35`、`U 128.84`、`V 127.97` = 真偏黑、色度中性）；全部 rc=0、crashes 0。
+
+细节见 [docs/V4L2_CAMERA.md](V4L2_CAMERA.md) §17。
+
+## 21. ★★★ 2026-10-08 凌晨 X：**转换器第二轮优化** ⇒ 原生 1080p120 打满、4K60 稳态打满
+
+**三处改动**：① **并行 band cache 失效**（新参数 `sync_parallel` 默认 1）： 原来在转换线程上一次性
+失效整块 18 MB（帧周期要付的串行时间），现在每个 worker 只失效自己那一带（带间重叠一行），
+`/proc/camcap_info` 新增 `sync=` 字段；② **worker 行 scratch 预分配**（快转换器要三行解包数据，
+原来每带每帧 `kmalloc_array`）；③ **满尺寸转换器内层去乘法**（输出指针递减，替掉每组一次的
+`(n-1-(x>>1))*4`）。另修账本 bug：`t_prev` 原来在 arm 线程入口初始化为 `ktime_get()`，第一帧把
+启动时间算成"帧间隔"（≈132 ms）⇒ 平均被拖低并造出假 `lost`；改成 `t_prev = 0` 起步。
+
+**实测**：`sync_parallel` 1 vs 0（custom3）**51.09 vs 45.88 fps**（整块失效的代价 ≈1.9 ms/帧）；
+vb2 缓冲 4 → 8 值 +2.3 fps（51.07 → 53.37），第 4 个 raw 槽再 +1.3（54.69）。**最终（`zz_rates.sh 150`，
+8 线程 / 4 槽 / 8 缓冲）**：custom2 **原生 1920×1080 avg 117.91 / timing 121.86（打满 120）**、
+custom3 **原生 4000×2256 timing 60.28（稳态打满；150 帧平均 50.79，被 3 次 ≥58 ms 突发拖低）**、
+normal_video 原生 4000×2256 **30.23**（传感器上限）、preview bin2 2000×1500 **32.76**（天花板）。
+`.ko` **914 528 B**，crash 0。对比 §19：1080p 112.7 → 120、4K60 48.5 → 稳态 60。
+
+细节见 [docs/V4L2_CAMERA.md](V4L2_CAMERA.md) §18。
+
 
 

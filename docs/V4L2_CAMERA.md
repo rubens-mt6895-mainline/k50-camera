@@ -1170,5 +1170,131 @@ vermagic 相同 ⇒ 代码同一、可直接加载。剩下的差异只有构建
 | `docs/REPRODUCIBLE_BUILD.md`（新） | 复现配方与 `srcversion` 取证 |
 | `scripts/z_build_camcap.sh` | 生成的 Makefile 加 `CFLAGS_cam_cap.o := -O3` |
 
+## 17. 2026-10-08 凌晨 IX：**四颗相机全部出帧**（CSI 端口参数化 + 微距 I2C 控制器 overlay）
+
+PR #18 的贡献者（Akisaira）用 Plasma Camera / Snapshot 实测四颗相机都能出图。这一节在我们的
+CAMSV 栈上把同一台机器的四颗相机全部复现，并把驱动里写死的"端口 2"参数化。
+
+### 17.1 四颗相机与它们的 CSI 通路
+
+| 相机 | 传感器 | 物理 CSI 口 | SENINF intf | PHY 节点 | D-PHY_TOP | CTRL / CSI2 | 输出 | 实测 |
+|---|---|---|---|---|---|---|---|---|
+| 主摄 | IMX582 (0x10) | 2 | 4 | `0x11c84000` | `0x11c86000` | `0x1a014200` / `0x1a014a00` | 4000×3000 → 2000×1500 | 33.4 fps（bin2）、原生 4K30 30.2 |
+| 前摄 | IMX596 (0x10) | 0 | 0 | `0x11c80000` | `0x11c82000` | `0x1a010200` / `0x1a010a00` | 2592×1952 | 29.8 fps |
+| 超广角 | S5K4H7 (0x2d) | 1 | 2 | `0x11c90000` | `0x11c92000` | `0x1a012200` / `0x1a012a00` | 3264×2448 | 30.2 fps |
+| 微距 | GC02M1 (0x37) | 3 | 6 | `0x11c94000` | `0x11c96000` | `0x1a016200` / `0x1a016a00` | 1600×1200 | 30.2 fps |
+
+规则（来自他们的 `drivers/media/platform/mediatek/isp/isp71/mtk_seninf71*.c` 与 `mt6895.dtsi`）：
+
+- PHY 节点内布局 = `ANA A +0x0000`、`ANA B +0x1000`、`DPHY_TOP +0x2000`、`CPHY_TOP +0x3000`；
+- **DT 端口号就是 SENINF pad 号**，`inputs[i].intf = i`，只有偶数端口受支持（"Interface 2N receives
+  CSI port N as a whole (4D1C)"），所以**物理口 N ⇒ SENINF intf 2N**；
+- `SENINF_TOP_PHY_CTRL_CSI(p) = 0x0040 + 4*p`（p = 物理口号），`SENINF_CTRL_BASE(i) = 0x0200 +
+  0x1000*i`，`SENINF_CSI2_BASE(i) = 0x0a00 + 0x1000*i`；
+- 四颗相机在 `rubens.dts` 里分别是 `seninf_csi0_in`（前摄）/ `csi1_in`（超广角）/ `csi2_in`（主摄）
+  / `csi3_in`（微距），**全部经 CAM_MUX 3 汇到同一个 CAMSV**（`camsv0@1a110000` = 我们树里的
+  `camsv1@1a110000`）⇒ 同一时刻只能一颗出流。
+
+驱动侧的改动只有三处（其余本来就通用）：新增 `SENINF_TOP_PHY_CTRL_CSI(p)` 宏、route 改用
+`SENINF_TOP_PHY_CTRL_CSI(route_intf / 2)`、`cam_rx_set_rate()` 改用 `SENINF_CSI2_BASE(route_intf)`。
+于是 `route_intf` + `dphy_base` 两个模块参数就能覆盖任意端口。
+
+### 17.2 新增工具（都在 `scripts/`）
+
+| 脚本 | 作用 |
+|---|---|
+| `gen_sensor_tables.py <driver.c> <outdir> [表名…]` | 从他们的驱动里抽出 `cci_reg_sequence` 表，转成设备侧可重放的 `0xREG 0xVAL` 文本 |
+| `sensor_bring.py <bus> <addr> <table.txt>…` | 通用传感器重放：8 位（A8=1）或 16 位寄存器地址、ID 回读、`0x0100` 上电时序 |
+| `csirx_bring.py [port] [link_mhz] [秒] [lane 数] [trail_ns]` | 按端口算 ANA/DPHY/TOP/CTRL/CSI2 基址与重定时值，重放厂商 CSI-RX 上电序列 |
+| `zz_front_cap.sh` / `zz_uw2.sh` / `zz_macro_cap.sh` | 前摄 / 超广角 / 微距的端到端上电 + 抓帧 |
+| `zz_macro_grab.sh` | 把当前微距配置抓成 `/root/macro.yuyv` |
+| `dt/ovl_i2c4.dts` + `src/ovl_i2c4.c` + `z_build_ovl6.sh` | 微距专用的运行时 device-tree overlay 模块 |
+
+### 17.3 微距的特殊之处：我们 DT 里没有 `i2c@11d03000`
+
+微距挂在 `i2c4`（`0x11d03000`）上，而我们树里只有 `i2c_cam_a/b/c/d`（`11d01000/11d02000/11d05000/
+11d06000`）与 `i2c7`（`11d04000`）⇒ 这条控制器**必须由运行时 overlay 新建**。用的就是既有的
+`cam_ovl` 机制（`of_overlay_fdt_apply` + `.incbin` 的 dtb），踩了两颗雷：
+
+1. **`OF: overlay: Invalid overlay_fdt header`（-22）**：内核的 `fdt_check_header()` 第一件事就是
+   要求 FDT 块**8 字节对齐**（`if ((uintptr_t)fdt & 7) return -FDT_ERR_ALIGNMENT;`）。`.incbin`
+   紧跟 `pr_info` 字符串 ⇒ 落在 `.rodata` 的 4 mod 8 上。修法 = 在 `ovl_blob.S` 里
+   `ovl_i2c4_blob_start:` 前加 `.balign 8`（复核偏移 `0x68` ✓）。
+2. **`OF: overlay: symbols in overlay, but not in live tree`（-22）**：dtc 带 `-@` 会生成
+   `__symbols__` 节点，而我们的 live DT **没有** `/__symbols__` ⇒ 去掉 `-@`、并给 dts 里的节点去掉
+   标签（无标签就不会生成 `__symbols__`）。另外给模块加了 `module_exit` + `of_overlay_remove`
+   （否则 overlay 模块不可卸载，开发期只能换名字）。
+
+成功后：`/proc/device-tree/soc@0/i2c@11d03000` 出现、`/dev/i2c-*` 多出一条（动态次设备号），
+`0x37` 上的 GC02M1 回读 `0xf0=0x02 0xf1=0xe0` = 芯片 ID `0x02e0` ✓。
+
+### 17.4 证据（不是"看起来对"）
+
+- 每颗相机都抓到真帧并核对计数：`cam_mux_chk : 0x04b00640 (CHK_RES)` = 1200|1600（微距）、
+  `0x09900cc0` = 2448|3264（超广角）、`frame_ready 1 / last_result 0`；
+- 帧率与传感器的 HTS×VTS 自洽（微距 2192×1268 @ 84 MHz = 30.0 fps ✓）；
+- 抓到本地的帧用 `scripts/render_yuyv.py` 渲染：微距首帧 `Y mean 12.35`、`U 128.84`、`V 127.97`
+  （凌晨、AE 关闭 ⇒ 真正偏黑、色度中性，不是均匀灰假像）；
+- 全部 rc=0、crashes 0。
+
+## 18. 2026-10-08 凌晨 X：**转换器第二轮优化 + 帧率账本修正** ⇒ 原生 1080p120 打满
+
+§16 之后剩下的差距是"转换受限"。这一轮把每帧的**串行成分**再切一刀。
+
+### 18.1 三处改动
+
+1. **并行 band cache 失效**（新参数 `sync_parallel`，默认 1）：传感器经 DMA/IOMMU 写入，CPU 读之前
+   必须失效可缓存别名。原来在转换线程上一次性 `dma_sync_single_for_cpu()` 整块 18 MB（这是帧周期
+   要付的串行时间）；现在每个 worker 只失效**自己那一带**（`cam_band_sync()`，带之间重叠一行，
+   保证每行都被覆盖），并把最大值记进 `t_sync`/`s_sync`，`/proc/camcap_info` 的 `timing`/`avg`
+   两行新增 `sync=` 字段。`sync_parallel=0` 保留旧的整块路径以便对照。
+2. **worker 行 scratch 预分配**：`cam_v4l2_convert_full_fast()` 需要三行解包数据
+   （`3*(cam_src_w+2)` 个 `u16`），原来是**每带每帧** `kmalloc_array` 一次（分配器抖动 + 每帧
+   8 次分配）。现在池启动时每个 worker 分配一次，停止时释放，`scratch == NULL` 时才回退到
+   临时分配（并保留 `_ref` 兜底）。
+3. **满尺寸转换器内层循环去乘法**：输出指针改为递减（`q = o + (n-1)*4` 起，循环头 `q -= 4`），
+   替掉每组一次的 `(n - 1 - (x >> 1)) * 4`（180° 翻转语义不变）。
+
+另修一个**账本 bug**：`t_prev` 原来在 `cam_v4l2_thread()` 入口初始化为 `ktime_get()`，于是第一帧的
+"间隔"把整段启动时间算了进去（实测那一帧 ≈132 ms）⇒ 150 帧平均被拖低（18.7 ms vs 稳态 16.8 ms），
+`dist` 里还会出现一次假 `lost(>=58ms)`。改成 `t_prev = 0` 起步，第一帧只对时不计入。
+
+### 18.2 实测（真机，`conv_threads=8`）
+
+`sync_parallel` A/B（custom3 4000×2256@60，60 帧）：
+
+| `sync_parallel` | avg fps | `sync=`（avg） | `sync=`（串行整块的代价） |
+|---|---|---|---|
+| **1（默认）** | **51.09** | 382 µs | 每带最大 0.15–0.38 ms |
+| 0 | 45.88 | 1927 µs | ≈1.9 ms/帧 |
+
+⇒ 并行 band 失效值 **+11%**。
+
+槽数与 vb2 缓冲数（custom3）：
+
+| 配置 | avg fps | 稳态 timing fps |
+|---|---|---|
+| 3 槽 + 4 个 mmap 缓冲 | 51.07 | 60.06 |
+| 3 槽 + **8 个 mmap 缓冲** | 53.37 | 59.61 |
+| **4 槽 + 8 个缓冲** | **54.69** | 59.35 |
+
+⇒ 用户态给足缓冲值 +2.3 fps，第 4 个 raw 槽再 +1.3 fps（三个额外槽都能分配成功）。
+
+### 18.3 最终帧率表（`zz_rates.sh 150`，`conv_threads=8 pipe_slots=4 sync_parallel=1`，8 个 mmap 缓冲）
+
+| 模式 | 输出 | 描述符 | avg fps | timing fps | 判定 |
+|---|---|---|---|---|---|
+| custom2 1920×1080 | **原生 1920×1080** | 120.09 | **117.91** | 121.86 | **打满（±2%）** |
+| custom3 4000×2256 | **原生 4000×2256** | 60.02 | 50.79 | **60.28** | 稳态打满，平均被偶发突发拖低 |
+| normal_video 4000×2256 | 原生 4000×2256 | 30.00 | 30.23 | 30.16 | 传感器上限，打满 |
+| preview 4000×3000 | 2000×1500（bin2） | 33.26 | 32.76 | 33.18 | 传感器上限，打满 |
+
+对比优化前（§16 的表）：1080p 原生 112.7 → **120**、4000×2256@60 原生 48.5 → 稳态 **60**、
+4000×2256@30 与 binned 2000×1500 打满不变；`.ko` **914 528 B**，crash 0。
+
+**仍然要如实说的**：custom3 原生 4K60 的 **150 帧平均** 是 50.8–53.5 fps（稳态 60.3），差距来自
+偶发的 ≥58 ms 突发（每 150 帧 3 次，`dist` 里是 `lost`），不是转换吞吐不够： 半尺寸
+2000×1128@60 与 960×540@120 都是稳稳打满。
+
 
 

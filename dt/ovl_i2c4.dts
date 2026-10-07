@@ -1,0 +1,37 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Runtime overlay: add the camera I2C controller at 0x11d03000 (I2C4, "I2C
+ * wrap S") to the live device tree so the macro camera's GC02M1 (address
+ * 0x37) can be reached. Our SoC dtsi never declared this controller, so the
+ * node is created here rather than enabled.
+ *
+ * The live DT has no __symbols__, so phandles are raw numbers and the overlay
+ * must not carry a __symbols__ node: dtc is run WITHOUT -@ and this node has no
+ * label to export.  Kept in the same style as ovl_pwr.dts.
+ * Both clock phandles are copied from the working camera bus
+ * i2c@11d01000 (identical providers):
+ *   clocks = <0x29>, <0x2a>   (main, dma)
+ * interrupts uses the GIC's 4-cell form: <SPI 148 LEVEL_HIGH 0>.
+ */
+/ {
+	fragment@0 {
+		target-path = "/soc@0";
+		__overlay__ {
+			i2c@11d03000 {
+				compatible = "mediatek,mt6895-i2c";
+				reg = <0x11d03000 0x1000>,
+				      <0x11300300 0x100>;
+				interrupts = <0 148 4 0>;
+				clocks = <0x29>, <0x2a>;
+				clock-names = "main", "dma";
+				clock-div = <1>;
+				clock-frequency = <400000>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				status = "okay";
+			};
+		};
+	};
+};
