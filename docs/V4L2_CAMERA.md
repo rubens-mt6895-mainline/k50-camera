@@ -1330,15 +1330,19 @@ cam_af: scan 2 done, pos=0 metric=0 (was 0), stubborn=1
 | 旋钮 | 默认 | 作用 |
 |---|---|---|
 | `af_floor` | 200 | 低于它的样本仍然记录，但**不能赢得比较**；0 = 旧行为 |
-| `af_fallback` | 0 | 首次扫描且没有任何历史位置时的落点（0 = 机械静止点，即 macro） |
-| `CAMCAP_AF_FLAT_FRAMES` | 300（≈10 s） | 平坦场景里的重扫最小间隔 |
+| `af_fallback` | 512 | 首次扫描且没有任何历史位置可用时的落点（量程中点；机械静止点 0 是 macro 端，不适合手机相机） |
 
 行为改动：① 样本采纳变成 `m >= af_floor && m > best_metric`；② HOLD 里 `m < af_floor` 时
-**不 wobble**、重扫限速到 300 帧；③ 扫描结束时若 `best_metric < af_floor`，置 `flat`、把镜头放回
-**扫描开始时的位置** `hold_pos`（而不是噪声赢家）；④ 成功扫描后记住 `hold_pos = best_pos` 供下次回退；
-⑤ wobble 也不接受低于下限的"赢家"；⑥ `af_fallback` 只在完全没有历史时用。
+**既不 wobble 也不再搜**（置 `flat` 后停在上一轮留下的位置，等场景恢复对比度：届时的
+`!best_metric` 支路会以 `CAMCAP_AF_RESCAN_FRAMES`（12）帧的节奏重启一轮）；③ 扫描结束时若
+`best_metric < af_floor`，置 `flat`、把镜头放回 **扫描开始时的位置** `hold_pos`（而不是噪声赢家）；
+④ 成功扫描后记住 `hold_pos = best_pos` 供下次回退；⑤ wobble 也不接受低于下限的"赢家"；
+⑥ 取 `hold_pos` 时会拒绝 `0xffff` 哨兵（`cam_vcm_init()` 会把它留在 `cam_vcm_pos` 里），
+无历史位置时用 `af_fallback`。
 
 `/proc/camcap_info` 的 `af` 行新增 `floor=`/`flat=`。
+
+（`#define CAMCAP_AF_FLAT_FRAMES` 是 ② 的旧版限速旋钮，改成"停住等人"之后不再被引用，保留仅作记录。）
 
 ### 19.3 真机验证
 

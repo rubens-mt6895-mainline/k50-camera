@@ -85,10 +85,19 @@ done
 # --- 11. full-frame capture: 12-bit, 1.5 bytes/row per pixel, PAK_MODE=0x82 + DBL/PAK coupling ---
 # (see docs/CAMERA_CAPTURE_WORKING.md; render locally with scripts/k50_shot.ps1)
 echo "--- 11. CAMSV capture: complete 12-bit frame (${MW}x${MH}, ${MSTRIDE} B/row) ---"
-if ! lsmod | grep -q "^cam_cap "; then
-  insmod /root/cam_cap.ko dbl_data_bus=2 pak_mode=0x82 pak_dbl=2 \
-      route_pix_mode=2 frame_bytes=$MFRAME
-  echo "  insmod rc=$?"
+# CAM_V80_NO_INSMOD=1: only do the sensor/receiver bring-up.  cam_boot.sh sets it
+# so cam_cap is registered exactly once per boot, by zz_cam_up.sh.  Loading it
+# here and again there makes udev/GStreamer see a device that was removed and
+# re-added, which leaves duplicate "MT6895 CAMSV1 (IMX582)" rows in applications
+# that keep a device monitor running (Cheese).
+if [ -z "${CAM_V80_NO_INSMOD:-}" ]; then
+  if ! lsmod | grep -q "^cam_cap "; then
+    insmod /root/cam_cap.ko dbl_data_bus=2 pak_mode=0x82 pak_dbl=2 \
+        route_pix_mode=2 frame_bytes=$MFRAME
+    echo "  insmod rc=$?"
+  fi
+else
+  echo "  CAM_V80_NO_INSMOD set: leaving cam_cap to zz_cam_up.sh"
 fi
 echo route > /proc/camcap 2>/dev/null
 touch /tmp/.cam_routed

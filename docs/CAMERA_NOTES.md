@@ -1603,10 +1603,11 @@ DAC 0 = 机械静止点 = macro 焦距；HOLD 每 `12 << stubborn` 帧（≈3 s�
 **两个根因**：① `cam_af_start()` 用严格 `m > best_metric` 且 `best_pos` 初值是第一个粗点 ⇒ 整轮无赢家时
 停在 0；② 重扫条件 `m*100 < best*70` 在 `best≈2` 时由噪声满足 ⇒ 反复重扫。
 
-**修复**：新参数 `af_floor`（默认 200，低于它不能赢得比较）、`af_fallback`（默认 0，仅无历史时用）、
-`CAMCAP_AF_FLAT_FRAMES`（300 帧 ≈10 s 的重扫限速）；新增 `hold_pos`/`flat`：扫描无可用点时把镜头
-**放回扫描开始的位置**，成功时记住它；平坦时不 wobble；wobble 也不接受低于下限的赢家。
-`af` 行新增 `floor=`/`flat=`。
+**修复**：新参数 `af_floor`（默认 200，低于它不能赢得比较）、`af_fallback`（默认 **512** = 量程中点，仅
+无历史位置可用时用；`0xffff` 哨兵会被拒绝）、新增 `hold_pos`/`flat`：扫描无可用点时把镜头
+**放回扫描开始的位置**（成功扫描后记住它）；平坦时**既不 wobble 也不再搜**，停在原地等场景恢复对比度
+（恢复后由 `!best_metric` 支路按 `CAMCAP_AF_RESCAN_FRAMES`=12 帧重启一轮）；wobble 也不接受低于下限的赢家。
+`af` 行新增 `floor=`/`flat=`。（`CAMCAP_AF_FLAT_FRAMES` 是旧版"每 10 s 重扫一次"的限速旋钮，已不再引用。）
 
 **验证**：修复后 `af auto` → `scan 1 done, pos=512 metric=920`，此后 5 次 wobble 全部 `wobble held
 pos=512`（±64 邻居 916–921，从未好 1%），25 s 静默窗内无新扫描，33.3 fps 不掉。**独立验证**：

@@ -34,8 +34,8 @@ sleep 1
 fuser -k /dev/video0 2>/dev/null
 sleep 1
 
-echo "--- 3. sensor bring-up (zz_v80.sh)"
-sh /root/zz_v80.sh
+echo "--- 3. sensor bring-up (zz_v80.sh, no module load)"
+CAM_V80_NO_INSMOD=1 sh /root/zz_v80.sh
 echo "    zz_v80 rc=$?"
 
 echo "--- 4. V4L2 stack (zz_cam_up.sh)"
