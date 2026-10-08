@@ -1519,6 +1519,124 @@ bin=1 的满尺寸路径（`cam_v4l2_convert_full_fast()`）一直用的是 gamm
 | `out/re/zz_af2.sh` · `out/re/zz_af2_run.sh` | AF v2 行为验收（90 s 搜索/抖动计数） |
 | `out/re/zz_park.sh` · `out/re/zz_push_run.sh` | park（命令行 + 卸载路径）验收 / 通用推送 |
 
+## 21. 2026-10-09 凌晨 XIII：**真重启验证通过** + 4K60 600 帧全清 + 度量 A/B 失败复盘
+
+用户 2026-10-08 深夜说（原话）「我现在不在机器旁边，你先记录吧，然后机器3点关机，你趁着这个时候
+做一些你想做的事，不要浪费了时间；相关的内容也推送一下吧」：本节就是"想做的事"的三件：
+① 把 §16 的"开机只注册一次"用**真重启**验证；② 把 4K60 那条"偶发 ≥58 ms 突发"复测清楚；
+③ 试着在真机上复现 §20.1 的度量饱和（没做成，原因有价值）。
+
+### 21.1 真实重启：开机只注册一次 ✓
+
+`out/re/zz_reboot_check.sh`（推检查脚本 → `/sbin/reboot` → 等 ssh → 等服务 → 跑 `zz_boot_check.sh`）：
+
+| 项目 | 实测 |
+|---|---|
+| 设备回来 | 重启后 15 s（第 2 次 ssh 尝试） |
+| 服务 | `activating` 8/16/24 s → **active 32 s**，`ExecStart=/root/cam_boot.sh (code=exited, status=0/SUCCESS)` |
+| 启动耗时 | 00:33:18 → 00:33:43 ≈ **25 s** |
+| boot_id | `60c5f5f9-9540-4873-a53f-8f0932dc921b`（新） |
+| **cam_cap 注册次数** | **`registered : 1` / `loaded : 1`** ✓（此前同一会话里是 15 次） |
+| cam_cap 移除记录 | **空**（无 unregister/rmmod 行） |
+| `/dev/video0` | `crw-rw----+ root video 81,0` ✓，`/sys/class/video4linux/` = `video0` |
+| 实拍 20 帧 | 32.76–33.34 fps、`arm_count 21`、`frame_ready 1`、`stats r=254 g=255 b=257`、`af auto state=coarse metric=314 y=10 floor=20`、crashes 0 |
+| 内核 cmdline | `root=/dev/sdc83 rootwait` ✓ |
+| `/var/log/cam_boot.log` 结尾 | `RESULT: ok  /dev/video0 cam_cap` ✓ |
+
+口径提醒：检查脚本打的 `removal : 8` 是 **regex 太宽**的假阳性（`grep -ciE 'unloaded|removed'` 命中了
+别的子系统的行）：**判据是 `registered : 1` 加上"cam_cap 的移除列表为空"**。
+重启会清 `/tmp`，所以 `gst_enum.py` 没了，GStreamer 的设备计数这一轮没复核（§17 的 1 个设备结论不受影响）。
+
+### 21.2 4K60（custom3 4000×2256@60）：600 帧 × 4 变体，全部干净 ✓
+
+`out/re/zz_burst.sh` / `zz_burst4.sh`，每个变体 600 帧：
+
+| 变体（`conv_threads=8`, pipe_slots, sync_parallel, mmap） | clean | late/slip/lost | 墙钟 600 帧 | `timing` fps | `avg` fps | sync |
+|---|---|---|---|---|---|---|
+| a: slots3 par1 mmap8 | 600 | 0/0/0 | 10.15 s（59.3 fps） | 59.99 | 59.40 | 66 µs |
+| b: slots4 par1 mmap8 | 600 | 0/0/0 | 10.15 s | 60.01 | 59.59 | 95 µs |
+| c: slots3 **par0** mmap8 | 600 | 0/0/0 | 10.15 s | 59.76 | 59.55 | 433 µs |
+| d: slots3 par1 **mmap4** | 599 | 1/0/0 | 10.15 s | 60.76 | 59.71 | 103 µs |
+
+⇒ §18 里那条"150 帧平均 51–53 fps、偶发 ≥58 ms 突发"**在当前构建上不可复现**：
+稳态就是 59.8–60.8 fps，600 帧一次不掉。另外 `sync_parallel=0`（变体 c）的同步成本从
+§18 时的 1927 µs 掉到 433 µs：因为第二轮的转换器优化把 conv 从 ~13 ms 压到 ~10.7 ms，
+"整块失效"这条串行路径的绝对成本跟着下来了。
+
+**但要说清楚**：同样的配置在下面 21.3 的 150 帧矩阵里又出现了 `2 lost + 1 slip`（avg 53.91）。
+所以准确的结论是：**稳态 60 fps 是确定的，≥58 ms 的稀疏hiccup仍会出现**（一轮 150 帧里 2 次），
+它足以拉低短测平均；600 帧全清说明它不是每帧级/每条路径必有的缺陷，而是环境与负载相关的偶发。
+真机复测时**别用 150 帧的平均值判断 4K60**，要看 `timing` 与 `dist`。
+
+### 21.3 重启后全模式帧率矩阵（`scripts/zz_rates.sh 150`）
+
+`conv_threads=8 pipe_slots=4 sync_parallel=1`，每路 `--stream-mmap=8`；重启后的新会话：
+
+| 模式 | 输出（bin=1 全尺寸） | `timing` fps | `avg` fps | timing conv | `dist` |
+|---|---|---|---|---|---|
+| normal_video 4000×2256@30 | 4000×2256 YUYV | **29.94** | 30.07 | 12.9 ms | 0 clean / **149 late** / 1 slip / 0 lost |
+| custom3 4000×2256@60 | 4000×2256 YUYV | **60.40** | 53.91 | 15.5 ms | 148 clean / 1 slip / 2 lost |
+| custom2 1920×1080@120 | 1920×1080 YUYV | **120.67** | 119.37 | 6.1 ms | **150 clean** / 0 lost |
+| preview（bin=2 预览） | 2000×1500 YUYV | **33.29** | 33.06 | 15.4 ms | 95 clean / 3 late / 2 slip |
+| 收尾恢复 preview | 2000×1500 | 33.23 | 33.64 | 16.7 ms | 29 clean / 1 slip |
+
+- **1080p120 打满**（119.4 平均、120.7 稳态、150/150 clean）✓；**4K30、4K60 稳态达传感器上限**✓。
+- `dist` 桶口径：桶是按 33.5 fps 天花板定的（`clean < 32 ms`），所以 **30 fps 模式（周期 33.3 ms）
+  的名义帧全部落进 `late(32–40 ms)`**：那不是掉帧，是桶标签的适用范围问题（§16 的 dist 表也是这个口径）。
+- 全模式 stats 正常（`r/g/b` 齐平、`clip=0%`），crashes 0。
+
+### 21.4 度量 A/B 的真机尝试：没做成，原因记下来
+
+想用**前摄 IMX596 + 手机自己的屏幕**当可控光源，在真机上复现 §20.1 的"度量饱和"（旧模块 vs 新模块同一场景对比）。
+
+环境（`out/re/zz_scr.sh`）：`card0-DSI-1 connected enabled modes=1440x3200` ✓；**`/sys/class/backlight` 不存在**
+（无法调亮度）；KDE Plasma Wayland 会话活着（`kwin_wayland`/`plasmashell`，用户 k50 seat0 tty1）；
+`gst-launch-1.0` + `videotestsrc` + `waylandsink` + `videoconvert` 齐、`python3 -c "import gi"` ok；
+`/dev/video0` 空闲、load 0.15、温度 46 °C。
+
+做法（`out/re/zz_ab_scr.sh`）：屏幕全屏播 `videotestsrc pattern=checkers-8 ! videobalance contrast=0.25
+brightness=0.35 ! waylandsink`（`waylandsink` 会打 `gst_wl_window_ensure_fullscreen: assertion 'self' failed`，
+但画面出得来）；前摄上电（GPIO158/150、fan53870 `i2c-11@0x35`：`0x0a=0x36 0x06=0xbf 0x04=0x89 0x03=0x65`
+读回 0x65、复位 GPIO153、`sensor_bring.py 8 0x10 imx596_init.txt imx596_2592x1952.txt`、`csirx_bring.py 0 678 3`）；
+14 次装/卸模块（bin=2 ⇒ 1296×976，`ae/awb/af/vcm` 全关，`exp_def` 取 8/16/32）。
+
+| 素材 | 老模块（线性 luma） | 新模块（千分比） |
+|---|---|---|
+| `exp_def=8 / 16 / 32` | 2092 / 2096 / 2095 | 480 / 477 ‰ |
+
+三组**几乎不动**，而 stats 显示 `r≈256 g≈256 b≈257, min_g 102–140, max_g 366–400, clip=0%, dark=41%,
+y=11–12` ⇒ 一幅很暗、低对比的图。**前摄的 `exp_def` 对画面没有可见影响**（驱动 `ae` 行报
+`hw=(0x0010,…)`，即它自己以为写进去了，但 raw 一直是 102..400）：这是个**新发现的待查问题**（21.5）。
+
+结论：**既没有可控光源、曝光又不响应，A/B 在真机上不成立**，§20.6 的"只能算术证明"保持不变。
+
+附带把**旧度量的真身**从 git（`c4796bcc0ca9`）取回来对清了：旧 `cam_af_metric()` = `(st->fv * 256) / st->fv_n`
+：**每采样对平均 |Δluma|（Q8）**，luma 是线性 `clamp(((77r+150g+29b)>>8),0,255)`。所以它死掉的
+条件是"**整幅图都在裁剪点以上**"（≈raw 222，还要算上 WB 的 r 1.25× / b 1.7× 增益），
+只要有暗像素它还活着：这也解释了本次暗场里旧度量 2092 ≠ 0。新度量是 `(Σ|Δgamma绿| × 1000) / Σ(gamma绿)`，
+曝光不变且不裁剪 ✓。
+
+### 21.5 待查：前摄的曝光没落地
+
+- `cam_sensor_apply()`（src/cam_cap.c:2987–3017）复查**无 bug**：`if (!sensor_ctl) return;` →
+  `cam_sensor_valid` + 三元脏检查 → 写 `0x0202` 曝光 / `0x0204` again / `0x020e` dgain →
+  失败时 `pr_warn("cam_cap: exposure write 0x%04x failed\n", …)`。
+- 所以下一步做前摄实验时**第一件事是 `dmesg | grep 'write .* failed'`**：`zz_ab_scr.sh` 当时把 dmesg
+  过滤掉了，没看告警（这是我自己的流程漏洞）。
+- 其他可能：前摄那条路（intf 0 / dphy 0 / `csirx_bring.py 0 678 3`）送的还是缺省行时序，或者那几颗
+  我们用的 vendor 模式表没有把曝光相关寄存器打开。主摄 4000×3000 这条路的曝光是好的（`ae` 行
+  `exp=` 与 stats 明显联动）⇒ 问题局限在前摄/sensor 表，不在通用 I²C 写路径。
+
+### 21.6 本轮新增工具
+
+| 脚本 | 用途 |
+|---|---|
+| `out/re/zz_scr.sh` | 屏幕/会话/工具链侦察（面板、backlight、gst、占用） |
+| `out/re/zz_ab_scr.sh` | 前摄 + 屏幕光的度量 A/B 尝试（含前摄上电全流程） |
+| `out/re/zz_reboot_check.sh` | 一条命令做"真重启 + 服务检查 + 开机注册检查" |
+| `out/re/zz_boot_check.sh` | 开机后采集：服务状态/枚举/注册次数/实拍帧率 |
+| `out/re/zz_burst.sh` · `out/re/zz_burst4.sh` | 4K60 600 帧 × 4 变体突发测试 |
+
 
 
 
