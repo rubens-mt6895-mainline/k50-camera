@@ -1741,6 +1741,14 @@ preview bin2 **33.29/33.06**。注意 `dist` 桶按 33.5 fps 天花板定义 ⇒
 构建：**919 416 B**、md5 `66c2056d2eaffa260a5a21ff7bd7c6ad`；设备留底 `/root/cam_cap_v2.ko` 可随时回退。
 细节见 [docs/V4L2_CAMERA.md](V4L2_CAMERA.md) §22。
 
+**★修复版的收尾三关**：① **真重启** ⇒ `registered : 1` / `loaded : 1`、`source: 4000x3000`、`output:
+2000x1500 YUYV, bin 2`、实拍 `timing fps=33.29`、crashes 0；② **默认栈长跑 6 分钟**（`zz_soak.sh 12000`）
+⇒ 12 000 帧 / 364.1 s = **32.96 fps**、`dist` clean 11 740 / late 153 / slip 105 / **lost 2**、
+**`scans` 全程 = 1（0 次额外重扫）**、`wobbles=6` 每次 `held pos=192`（镜头没动）、温度 49.9 → 50.6 °C、
+MemFree 9.41 → 9.24 GB、crashes 0；③ 相机仓 **9fa42e8** / 内核 **fbadb857e208** 已推送 ✓。
+（工具坑：`zz_reboot_check.sh` 是**主机侧**脚本，推到设备上跑会误报 `STILL DOWN`，已加守卫。）
+
+
 
 
 

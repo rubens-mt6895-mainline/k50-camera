@@ -1,33 +1,28 @@
 #!/bin/sh
-# zz_restore.sh - leave the camera on the default configuration (preview 4000x3000
-# binned to 2000x1500, mode_trace off, conv_threads 4) after a test run, and show
-# what the driver reports at load time.
+# Put the device back on the default preview stack with the fixed module
+# (/root/cam_cap.ko, pushed by the caller) and verify it captures.
 set -u
-W=/dev/video0
 
-pkill -x cheese 2>/dev/null
-fuser -k $W 2>/dev/null
-sleep 0.5
-rmmod cam_cap 2>/dev/null
-sleep 0.5
-dmesg -c >/dev/null 2>&1
+echo "=== modules before ==="
+lsmod | grep -c cam_cap
+md5sum /root/cam_cap.ko /root/cam_cap_new.ko /root/cam_cap_v2.ko 2>/dev/null
 
-MODE_W=4000 MODE_H=3000 MODE_STRIDE=6000 MODE_FRAME=18874368 \
-	sh /root/zz_v80.sh 2>&1 | grep -E 'IMX582 (ALIVE|DEAD)|frame_ready'
-CAM_CAP_PARAMS="exp_hsize=4000 exp_vsize=3000 out_width=2000 out_height=1500 v4l2_bin=2 conv_threads=4 pipeline=1" \
-	sh /root/zz_cam_up.sh 2>&1 | grep -E '\[!!\]|registered|streaming|source:|output:|mode:'
-sleep 1
+echo "=== unload if loaded ==="
+if grep -q '^cam_cap ' /proc/modules; then
+	rmmod cam_cap && echo "rmmod ok" || echo "rmmod FAILED"
+fi
 
-echo "--- load-time driver lines ---"
-dmesg | grep -E 'cam_cap: (source|mode|output|v4l2: registered)' | sed 's/^/  /'
+echo "=== bring up rails then camera (same order as cam_boot.sh) ==="
+CAM_V80_NO_INSMOD=1 sh /root/zz_v80.sh 2>&1 | tail -4
+sh /root/zz_cam_up.sh 2>&1 | tail -6
 
-echo "--- sensor ---"
-echo "  0307=$(i2ctransfer -f -y 10 w2@0x10 0x03 0x07 r1 2>&1) 0900=$(i2ctransfer -f -y 10 w2@0x10 0x09 0x00 r1 2>&1) 0340=$(i2ctransfer -f -y 10 w2@0x10 0x03 0x40 r1 2>&1) 0341=$(i2ctransfer -f -y 10 w2@0x10 0x03 0x41 r1 2>&1)"
+echo "=== verify ==="
+ls -l /dev/video0
+grep -E '^(avg|stats|af|ae|timing)' /proc/camcap_info 2>/dev/null | head -8
 
-echo "--- 30 frame check ---"
-timeout 20 v4l2-ctl -d $W --stream-mmap --stream-count=30 --stream-to=/dev/null >/dev/null 2>&1
-grep -E '^(avg|timing|dist|stats|ae)' /proc/camcap_info 2>/dev/null | sed 's/^/  /'
+echo "=== live check: 20 frames ==="
+timeout 12 v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=20 --stream-to=/dev/null 2>&1 | tail -3
+grep -E '^(avg|timing)' /proc/camcap_info 2>/dev/null
 
-echo "  crashes: $(dmesg | grep -icE 'oops|call trace|panic')"
-uptime
-echo "### zz_restore done"
+echo "=== crashes ==="
+dmesg | grep -icE 'Oops|BUG:|panic|segfault|Unable to handle|Internal error'

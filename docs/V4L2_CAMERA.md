@@ -1669,6 +1669,9 @@ y=11–12` ⇒ 一幅很暗、低对比的图。**前摄的 `exp_def` 对画面�
 | `out/re/zz_burst.sh` · `out/re/zz_burst4.sh` | 4K60 600 帧 × 4 变体突发测试 |
 | `out/re/zz_afnoise.sh` | 静态场景 N 秒对焦静默测试（`scans`/`wobbles`/退避/`ref` 全量打印） |
 | `out/re/zz_afae.sh` | **曝光摆动、场景不动**的对焦 A/B（`ae_target` 振子，见 §22.4） |
+| `out/re/zz_restore.sh` | 把设备恢复到默认预览栈（按 `cam_boot.sh` 的顺序）并实拍自检 |
+| `out/re/zz_st.sh` | 一条命令的设备状态（时钟/uptime/模块 md5/info 头/占用/load） |
+| `out/re/zz_soak.sh` | 默认栈长跑 N 帧（前中后快照：帧率、`dist`、AF 计数、温度、健康） |
 
 ---
 
@@ -1752,6 +1755,33 @@ if (m * 100 < cam_af.hold_ref * CAMCAP_AF_RESCAN_PCT)	/* 新：和自己比 */
 - 设备侧：新版 `/root/cam_cap_new.ko`；基线留底 `/root/cam_cap_v2.ko`（md5 `234a6ff5dd1bfd4c76c4c8817ceece80`，
   919 272 B）⇒ 随时可回退做 A/B。修复版装成 `/root/cam_cap.ko` 后，重启由 `cam-camera.service` 加载的
   就是修复版 ✓。
+- **发布前的真重启复验**（`out/re/zz_reboot_check.sh`，**主机侧**脚本）：修复版落到 `/root/cam_cap.ko` 后真
+  重启 ⇒ 服务正常 active、`registered : 1` / `loaded : 1`、开机日志 `source: 4000x3000 pixels, 6000
+  bytes/line, 18000000 raw bytes/frame` + `output: 2000x1500 YUYV, bin 2` + `v4l2: registered /dev/video0`、
+  实拍 21 帧 `timing fps=33.29`、`af … vcm=0x0c ready`、crashes 0 ✓（`removal : 8` 依旧是 §21.1 那条太宽的
+  grep 假阳性，真正的 cam_cap 移除列表为空）。⇒ **这份修复版已经过"真重启 + 单次注册 + 实拍"三关**。
+- 工具坑：`zz_reboot_check.sh` 要在工作站跑（它在本机拷 key 再 ssh）；用 `run_dev.sh` 推到设备上跑会得到
+  一串 `Permission denied` 然后误报 `STILL DOWN` ⇒ 脚本已加"必须在工作站运行"的守卫。
+
+### 22.7 默认栈长跑（"Cheese 开很久"的情形）
+
+`out/re/zz_soak.sh 12000`（默认参数：bin2 2000×1500、`af_enable=1`、`conv_threads=8`、`pipeline=1`）：
+
+| 指标 | 结果 |
+|---|---|
+| 帧数 / 墙钟 | 12 000 帧 / **364.1 s** ⇒ **32.96 fps**（传感器天花板 33.3） |
+| `avg` / `timing` | `avg fps=32.97 frames=12001 pipe=12022` / `timing fps=31.36` |
+| `dist` | **clean 11 740 / late 153 / slip 105 / lost 2**（≈97.8% clean，6 分钟丢 2 帧） |
+| **AF** | **`scans` 全程 = 1**（0 次额外重扫）✓；`wobbles=6`，间隔退避到上限 `next in 3000 frames`，每次都是 `wobble held pos=192`（**镜头一步没动**）✓ |
+| 基线 | `af … metric=552 y=15 ref=549`（EMA 紧跟度量 ✓） |
+| 温度 | `bq28z610-0` **49.9 → 50.6 °C**（+0.7 °C / 6 分钟） |
+| 内存 | MemFree 9.41 → 9.24 GB、MemAvailable 10.13 → 10.12 GB（**无泄漏迹象**） |
+| 健康 | crashes 0 ✓；load 1.71 → 5.05（推流中的 worker；停流即回落） |
+
+⇒ 修复后的默认栈在**用户实际的 Cheese 配置**下连跑 6 分钟：满帧率、几乎不丢帧、**对焦一次都没乱动**、
+温度与内存平稳 ✓。这也顺带证明 §22.2 的改法不会在长时间运行的场景里累积副作用。
+
+
 
 ### 22.6 诚实清单
 

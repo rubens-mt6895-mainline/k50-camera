@@ -3,6 +3,14 @@
 # Closes the gap left by zz_bootpath.sh, which only re-ran cam_boot.sh by hand.
 set -u
 KEY=/tmp/${K50_KEY}
+# HOST-SIDE script: it orchestrates ssh from the workstation, so the key has to
+# exist on *this* machine.  Running it on the phone (e.g. through run_dev.sh)
+# silently produced a bogus "STILL DOWN" because every ssh was denied -- bail
+# out loudly instead.
+if [ ! -f ${WINHOME}/.ssh/${K50_KEY} ]; then
+	echo "this script must run on the workstation, not on the device" >&2
+	exit 2
+fi
 cp -f ${WINHOME}/.ssh/${K50_KEY} "$KEY" 2>/dev/null
 chmod 600 "$KEY"
 O="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -o BatchMode=yes"
