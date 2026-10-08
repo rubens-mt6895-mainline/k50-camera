@@ -1859,3 +1859,64 @@ dist : clean(<1.15x)=78 late(1.15-1.6x)=0 slip(1.6-2.2x)=2 lost(>=2.2x)=0  nom=3
 - **唯一坏消息是 `hs_video`**：传感器确实在 240 fps 上跑（`arm=4225 µs` ≈ 标称周期 4165 µs），但整帧转换 4.0 ms + 取帧/ioctl 开销 ~1.3 ms ⇒ 实测 `timing` 182 fps。要吃满 240 fps 得再把 960×540 的 2×2 路径砍到 3 ms 以下。
 - `slip`/`lost` 的个数**每次运行都在变**（`custom3` 同一配置此前 600 帧全清、这次 3 个 lost）⇒ 它们是稀疏 hiccup 的计数，别拿单次数字下结论；`timing`/`avg` 的 period 更稳。
 - `dist` 的桶现在跟着模式走，所以同一份"1.6×"在不同模式下对应不同的绝对时间：preview 是 48 ms、custom3 是 26.6 ms、hs_video 是 6.7 ms： 高速模式对抖动的宽容度自然更小。
+
+### 24. 缓冲"装不下"时的守卫（以及一次自我更正）
+
+#### 24.1 怀疑的由来
+
+读 `VIDIOC_S_FMT` 的路径时注意到两件事：`cam_mode_geometry()`（`src/cam_cap.c:5878-5897`）会**无条件**改掉
+`out_width`/`out_height`/`exp_max`/`cam_mode_fps`，而 `cam_mode_match()`（`src/cam_cap.c:5861-5897`）选模式时
+只看 `m->hsize / bin == w && m->vsize / bin == h`、**不看缓冲大小**。于是推断：用 4000×2256 的几何装载
+（一条 raw 13.6 MB），应用再 `S_FMT` 到 4000×3000（raw 18 MB），CAMSV 的 IMGO DMA 就会写出缓冲之外。
+
+据此加了守卫： `static bool cam_mode_fits(const struct cam_sensor_mode *m)`（`src/cam_cap.c:5847-5853`，
+`need = m->hsize * m->vsize * 3 / 2` 与 `cam_buf_size`（未分配时退到 `frame_bytes`）比较），
+在 `cam_mode_match()`（`src/cam_cap.c:5877-5882`，附 `does not fit the %lu byte buffer` 日志）、
+`cam_mode_program()`（`src/cam_cap.c:6048` 起，返回 `-ENOSPC`）和两个 enum 循环里各拦一道。
+
+#### 24.2 真机测试：守卫没拦住： 因为**本来就不需要拦**
+
+`out/re/zz_fit.sh` 的 A 腿用 normal_video 几何装载：
+
+```
+sh /root/zz_v80.sh                                   # IMX582_MODE=normal_video, MODE_STRIDE=6000
+CAM_CAP_PARAMS="exp_hsize=4000 exp_vsize=2256 out_width=2000 out_height=1128 ..." sh /root/zz_cam_up.sh
+	→ cam_cap: source: 4000x2256 pixels, 6000 bytes/line, 13536000 raw bytes/frame
+	→ cam_cap: output: 2000x1128 YUYV, bin 2
+v4l2-ctl -d /dev/video0 --set-fmt-video=width=4000,height=3000,pixelformat=YUYV
+v4l2-ctl -d /dev/video0 -V                             # → Width/Height : 4000/3000   **被接受了**
+```
+
+随后 60 帧实测 `period=29953µs fps=33.38 nom=30066µs`： 正是 preview 的 VTS 3300 节奏，
+说明传感器真的切到了 4000×3000，而且**没有任何越界后果**（crashes 0）。
+
+原因在 `cam_cap_init()` 的 `v4l2_enable` 块（`src/cam_cap.c:6824-6844`）：它**故意把缓冲放大到表里最大的模式**：
+
+```c
+unsigned long maxneed = ALIGN((unsigned long)CAMCAP_IMX582_MAX_FRAME, 1024UL * 1024);
+if (need < maxneed)
+        need = maxneed;
+if (frame_bytes < need) { pr_info("v4l2_enable: growing frame_bytes %lu -> %lu\n", ...); frame_bytes = need; }
+```
+
+而 `#define CAMCAP_IMX582_MAX_FRAME 18000000`（**`src/imx582_modes.h:240`**）⇒ 缓冲恒为
+**18 874 368 B**（4000×3000 的 raw）⇒ **表内任何模式都装得下** ⇒ `S_FMT` 从来不会越界。
+**我最初怀疑的那个 latent overrun 不存在**（这也解释了为什么 `out/re/zz_matrix.sh` 能在同一个栈上
+自由切 6 个尺寸而不出问题）。
+
+#### 24.3 守卫为什么还是留下了
+
+因为 `dma_alloc_coherent()` 有 CMA 不够时的**折半回退**（`src/cam_cap.c:6966-6973`）：
+申请失败就 `want >>= 1` 一路退到 `CAMCAP_MIN_BUF`，此时 `cam_buf_size` 会**小于** `maxneed`。
+那种情况下守卫让过大的模式得到 `-ENOSPC`（且不出现在 `ENUM_FRAMESIZES` 里），而不是写出界。
+正常路径下 `need <= avail` 恒成立 ⇒ 守卫不改变任何既有行为。
+
+#### 24.4 诚实清单
+
+- 守卫在**正常路径下永不触发**，真机上**也没法主动触发**：显式 `frame_bytes=13631488` 会被 `maxneed`
+  重新抬回 18 874 368，要触发只能把 CMA 池弄小（侵入性太大，不做）。⇒ 这条结论是**逻辑审查**，没有运行证据。
+- A 腿的 60 帧是暗房数据，只用来证明"模式确实换了、没有崩"，不代表画质。
+- B 腿（恢复段）走 `sh /root/zz_restore.sh`：默认 4000×3000 几何、`-V` 2000/1500、
+  `--list-framesizes` 六条齐全（4000×3000 / 2000×1500 / 4000×2256 / 2000×1128 / 1920×1080 / 960×540）、
+  80 帧 `timing 33.12 fps`、`dist clean=78 late=1 slip=1`、`stats r=254 g=254 b=254 dark=48%`、
+  crashes 0、load 0.66 ⇒ **默认路径零回归**。

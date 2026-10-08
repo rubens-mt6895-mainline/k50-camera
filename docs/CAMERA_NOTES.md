@@ -1782,3 +1782,14 @@ MemFree 9.41 → 9.24 GB、crashes 0；③ 相机仓 **9fa42e8** / 内核 **fbad
 
 - `hs_video` 的 240 fps **打不满**：`arm=4225 µs`（≈ 标称 4165 µs）说明传感器在跑 240，但整帧转换 4.0 ms + 取帧开销 ~1.3 ms ⇒ 实测 182 fps。
 - `slip`/`lost` 逐次运行都在变（custom3 此前 600 帧全清、这次 3 个 lost）⇒ 只看 `timing`/`avg` 的 period。
+
+### 27. 缓冲 fit 守卫（以及一次自我更正）
+
+- 怀疑：`cam_mode_match()` 只看尺寸不看缓冲，而 `cam_cap_init()` 的 v4l2 块按 `exp_hsize/exp_vsize` 定缓冲 ⇒
+  用 4000×2256 装载再 `S_FMT` 到 4000×3000 会越界。
+- 事实：`cam_cap_init()`（`src/cam_cap.c:6824-6844`）**故意**把缓冲抬到 `ALIGN(CAMCAP_IMX582_MAX_FRAME, 1 MiB)`，
+  `CAMCAP_IMX582_MAX_FRAME = 18000000`（`src/imx582_modes.h:240`）⇒ 缓冲恒 18 874 368 B ⇒ 表内模式全都装得下，
+  **越界不存在**。真机 A 腿（normal_video 装载 → `S_FMT` 4000×3000 被接受 → 33.38 fps / nom=30066）证实这一点。
+- 守卫（`cam_mode_fits()`，`src/cam_cap.c:5847-5853`）仍保留：它只在 `dma_alloc_coherent()` 因 CMA 紧张
+  折半回退（`src/cam_cap.c:6966-6973`）之后才会拒绝过大的模式 ⇒ 正常路径行为零变化、真机无法触发。
+- B 腿（`zz_restore.sh`）：默认几何、六条 framesizes、33.12 fps、crashes 0 ⇒ 零回归。
