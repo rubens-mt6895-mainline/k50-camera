@@ -1296,5 +1296,97 @@ CAMSV 栈上把同一台机器的四颗相机全部复现，并把驱动里写�
 偶发的 ≥58 ms 突发（每 150 帧 3 次，`dist` 里是 `lost`），不是转换吞吐不够： 半尺寸
 2000×1128@60 与 960×540@120 都是稳稳打满。
 
+## 19. 2026-10-08 深夜 XI：**对焦在平坦场景里乱跑**的修复（对比度下限 + 平坦回退）
+
+§14 的自动对焦是"开环 VCM + 对比度爬山"。它在**场景没有对比度**时会坏，用户报的就是这个：
+镜头一直在动、最后停在一个没有依据的位置。
+
+### 19.1 两个现象，一个根因
+
+真机日志（暗场，`metric` 只有 0–2）：
+
+```
+cam_af: fine pos=0 metric=2 (best 2 @ 0)
+cam_af: scan 1 done, pos=0 metric=2 (was 0), stubborn=0
+cam_af: coarse pos=0 metric=0        # 第二轮：10 个粗位置全是 0
+cam_af: scan 2 done, pos=0 metric=0 (was 0), stubborn=1
+... 约 3 s 后又是一轮 coarse ...
+```
+
+- **停在 DAC 0**：`cam_af_start()` 把 `best_metric` 清 0、`best_pos` 设成第一个粗点（`af_min` = 0），
+  而样本采纳是严格 `m > best_metric`。整轮都是 0 时**没有赢家**，镜头就停在"机械静止点"：
+  这颗模组的静止点是 **macro 焦距（≈0.4 m）**，不是无穷远。
+- **反复重扫**：HOLD 里的重扫条件是 `m * 100 < best_metric * 70`，`best_metric ≈ 2` 时噪声就能满足，
+  周期是 `12 << stubborn` 帧 ⇒ `stubborn=3` 时**约每 3 s 扫一次**，每次把镜头扫过 10 个粗位置。
+
+两个现象合起来就是用户看到的"镜头一直抽、画面一直糊"。
+
+⚠️ **诊断陷阱**：`/proc/camcap_info` 的 `af` 行读的是**最后一帧**的统计。流没在跑时它是陈旧值：
+我第一次手工扫 11 个位置拿到一模一样的 `metric=227`，不是镜头不动，而是 **Cheese 打开着设备但流已经停了**
+（`vf_on: 0`、`int_status: 0`）。**先确认流在跑，再读 `af` 行。**
+
+### 19.2 修复
+
+| 旋钮 | 默认 | 作用 |
+|---|---|---|
+| `af_floor` | 200 | 低于它的样本仍然记录，但**不能赢得比较**；0 = 旧行为 |
+| `af_fallback` | 0 | 首次扫描且没有任何历史位置时的落点（0 = 机械静止点，即 macro） |
+| `CAMCAP_AF_FLAT_FRAMES` | 300（≈10 s） | 平坦场景里的重扫最小间隔 |
+
+行为改动：① 样本采纳变成 `m >= af_floor && m > best_metric`；② HOLD 里 `m < af_floor` 时
+**不 wobble**、重扫限速到 300 帧；③ 扫描结束时若 `best_metric < af_floor`，置 `flat`、把镜头放回
+**扫描开始时的位置** `hold_pos`（而不是噪声赢家）；④ 成功扫描后记住 `hold_pos = best_pos` 供下次回退；
+⑤ wobble 也不接受低于下限的"赢家"；⑥ `af_fallback` 只在完全没有历史时用。
+
+`/proc/camcap_info` 的 `af` 行新增 `floor=`/`flat=`。
+
+### 19.3 真机验证
+
+修复后在**有光**的房间（y≈100，房间里有对比度但指标仍在 900 上下）：
+
+| 时刻 | `af` 行 |
+|---|---|
+| 起流、手动 512 | `manual … pos=512 metric=922 floor=200 flat=0` |
+| `af auto` 后 20 s | `auto state=hold pos=512 metric=925 best=922 best_pos=512 hold=925 stubborn=0 scans=3` |
+| 再静默 25 s | `auto state=hold pos=512 metric=922 best=920 hold=922`；33.3 fps 不掉 |
+
+期间 5 次 wobble（约 7.5 s 一轮）全部 `wobble held pos=512`：±64 的两个邻居测到 916–921，
+**从未比 held 值好 1%** ⇒ 镜头留在 512，不再被噪声拖走。
+
+**独立验证**（不信任驱动自己的指标）：流跑着时在 DAC 0/256/512/768/1023 各抓一帧
+（`scripts/zz_afsharp.sh`），离机用 `scripts/sharpness.py` 量最后一帧：
+
+| DAC | Y mean | mean \|dY\|(列) | Laplacian 方差 | mean \|Laplacian\| |
+|---|---|---|---|---|
+| 0 | 101.9 | 3.51 | 194.2 | 10.87 |
+| 256 | 102.1 | 3.50 | 192.7 | 10.83 |
+| **512** | 99.7 | **3.63** | **206.1** | **11.16** |
+| 768 | 100.2 | 3.54 | 196.5 | 10.97 |
+| 1023 | 100.2 | 3.55 | 197.6 | 11.01 |
+
+三个独立指标全部在 512 取最大 ⇒ 驱动选的位置是对的。但**变化幅度只有 2–7%**：
+这一场（昏暗房间、高增益噪声主导）本身没有多少对焦信息。
+
+### 19.4 诚实清单
+
+- 对比度对焦**需要场景有对比度**。平坦/极暗场景下修好的是"不乱跑"，
+  不是"凭空找到焦点"：此时镜头保持在原位（`hold_pos`），并打印
+  `scan N found no contrast (metric … < floor), lens back to …`。
+- 指标是**平均 |dY|（Q8）**，不含任何高通/归一化 ⇒ 它的绝对值由场景纹理与噪声决定，
+  暗场噪声可以把它抬到几百，此时"有值"不等于"有信息"。真要更稳需要换成高通/Laplacian 类指标，
+  或只在采集时给用户一个手动焦点（`v4l2-ctl -c focus_absolute=N`）。
+- `scans` 计数同时把 wobble 计进去（一次 wobble 也 `scans++`），所以它比"粗扫描次数"大。
+- 验证时把用户的 Cheese 结束了（`fuser -k /dev/video0` 是测试脚本第 0 步）。
+
+### 19.5 新增/相关工具
+
+| 脚本 | 用途 |
+|---|---|
+| `scripts/zz_afnow.sh` | 只读：AF/AE 参数 + `af`/`avg`/`timing`/`stats`/`route` 行 + dmesg AF 尾 + 设备持有者 |
+| `scripts/zz_afdiag.sh` | 手工扫：`af off` → 逐点 `af pos N` 量指标 → `af auto` 观察 |
+| `scripts/zz_af_fix.sh` | 回归验收：起流 → `af auto` → 20 s/25 s 观察"不得乱跑" → 手工扫对比度 |
+| `scripts/zz_afsharp.sh` | 在多个 DAC 位置各抓帧，供离机测量 |
+| `scripts/sharpness.py` | 离机算 `mean |dY|`、Laplacian 方差/均值（独立于驱动指标） |
+
 
 
