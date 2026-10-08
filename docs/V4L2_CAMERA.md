@@ -1393,4 +1393,132 @@ cam_af: scan 2 done, pos=0 metric=0 (was 0), stubborn=1
 | `scripts/sharpness.py` | 离机算 `mean |dY|`、Laplacian 方差/均值（独立于驱动指标） |
 
 
+## 20. 2026-10-08 深夜 XII：**对焦指标在正常照明下饱和** + 原厂 AF 逆向 + 四摄谁有马达
+
+用户 2026-10-08 深夜报（原话）：「大概就是偶尔对焦很频繁，手没动都对，有时又死活不对焦，
+比如在场景中没有文字的情况下不对焦；你先把其他几个头的对焦也做了先吧然后逆向原厂相机对焦相关的东西
+看看呗原厂怎么对」：三个问题，一个是真 bug，一个是硬件事实，一个是资料逆向。
+
+### 20.1 根因：度量在 255 处饱和（"有时行有时不行"就是这么来的）
+
+§19 修的是"无对比度时别乱跑"，但度量本身有个更早的缺陷：**bin=2 路径（Cheese 默认的
+2000×1500 预览）用的是线性灰度** `clamp(((77*r + 150*g + 29*b) >> 8), 0, 255)`。raw 电平一旦
+超过 **~435**（"正常照明的房间"的门槛，约等于整幅画面 raw 均值 > 10% 满幅），两个样本**同时钳到 255**
+⇒ `fv = 0` ⇒ `metric = 0 < af_floor` ⇒ **搜索判定"平坦"、永远不聚焦**；同时 `best_metric` 恒为 0
+⇒ 每 12 帧走一次 `!best_metric` 重扫 ⇒ **"手没动也对个没完"**。两条症状同一个根因。
+bin=1 的满尺寸路径（`cam_v4l2_convert_full_fast()`）一直用的是 gamma 后的 `ly0/ly1`
+⇒ **同一个场景两条路径结论不同**，这就是用户说的"有时行有时不行"。
+
+`scripts/check_af_metric.py` 把新旧度量在同一组 raw 电平上跑（合成纹理 ±1 LSB）：
+
+| raw 绿电平 | 120 | 300 | 600 | 1200 | 2400 | 3600 |
+|---|---|---|---|---|---|---|
+| 旧（线性、未归一化，Q8） | 10229.8 | **0.0** | **0.0** | **0.0** | **0.0** | **0.0** |
+| 新（对比度千分比） | 1000 | 217 | 127 | 91.5 | 74.5 | — |
+
+这张表就是"暗房间能用、有光就废"的全部原因。
+
+### 20.2 修复
+
+| 位置 | 改动 |
+|---|---|
+| `cam_luma8()` (src/cam_cap.c:4170 附近) | 整段替换为 `cam_metric_px(u32 g) = cam_lut_g[min(g,4095)]`：走输出用的 gamma LUT，绿 tap 不带白平衡增益，且**不会饱和** |
+| 2×2 band + full-ref 两个站点 | `cam_metric_px(g0)` / `cam_metric_px(g1)`（`replace_all`）；full-fast 里原本就是 LUT 后的绿，改成直接取 `g0/g1` |
+| `cam_af_metric()` | 从"平均 \|dY\|（Q8）"改成**对比度千分比**：`(fv * 1000) / fv_y`，并加近黑守卫 `level = fv_y/(2*fv_n) < CAMCAP_AF_MIN_LEVEL(6)` ⇒ 返回 0（黑帧的噪声比率不是对比度） |
+| `af_floor` 默认 | 200 → **20**（新增的千分比量纲） |
+| 抖动退避（新） | `cam_af.wobble_period`：守住一次翻倍（`CAMCAP_AF_WOBBLE_FRAMES 240` → 上限 `CAMCAP_AF_WOBBLE_MAX 3000` 帧 ≈ 100 s），赢了复位；抖动前 `if (cam_ae_auto && cam_ae_settle) return;` 不跨 AE 台阶测量；`af` 行新增 `per=` |
+| `CAMCAP_AF_RESCAN_FRAMES` | 12 → **30** |
+| 计数分开 | `scans` 只数完整搜索，新增 `wobbles` 单独数抖动（§19 的诚实清单里那条"scans 混进 wobble"现在修好了；`af` 行新增 `wobbles=`） |
+| `park`（新） | `cam_vcm_park()`：按原厂 `dw9800v_power_off()` 的做法，以 **16 为步长、每步 `usleep_range(8400,9400)`** 把 DAC 降到 0（0 = 无穷远端），避免硬归零的机械冲击；模块 `__exit` 与 `/proc/camcap` 的 `park` 命令都会调用 |
+
+### 20.3 真机验证（2026-10-09 00:04，暗房，917064 B 构建）
+
+90 秒推流（`out/re/zz_af2.sh`）：
+
+| 时刻 | `af` 行 |
+|---|---|
+| t=10 s | `auto state=hold pos=0 metric=549 y=15 best=545 best_pos=0 hold=549 floor=20 flat=0 low=0 stubborn=0 scans=2 per=480` |
+| t=40 s | `… metric=553 … scans=3 per=960` |
+| t=85 s | `… metric=560 … scans=4 per=1920` |
+
+- `dmesg`：**`scan 1 done, pos=0 metric=313 (was 0)`**： 90 秒内**只有 1 次搜索**（旧代码约 11 次）。
+- **3 次抖动，间隔 240 → 480 → 960 → 1920 帧翻倍**，全部 `wobble held`。
+- 帧率 33.1 fps、crashes 0。`scans=4` = 1 次搜索 + 3 次抖动（新口径下 `wobbles` 单独可见）。
+- 暗房（`y=15`）里度量仍有 546–560‰ ⇒ 阈值 20‰ 留了很大余量。
+
+**park 实测**（917064→919272 B 构建）：`echo park > /proc/camcap` 在推流中把 `pos=640` 打到 `pos=0`
+（rc=0，不打断推流）；`af pos 768` 后 `rmmod` ⇒ dmesg `VCM parked at 0 (infinity end)`，
+`unregistered` 与 `parked` 之间 **459 ms** = 48 步 × ~9.5 ms，正是那条 ramp。
+
+### 20.4 原厂 AF 逆向（HyperOS super.img）
+
+素材：`${WINPATH}\手机刷机包-备份\K50(Rubens)刷机文件\[正式版]HyperOS3.0.7.0_For_K50\images\super.img`
+（9.13 GB liblp）+ 项目目录里的 `images/`。工具链全部落在 `out/re/`：
+
+| 文件 | 作用 |
+|---|---|
+| `out/re/lp.py` | 零依赖 liblp 解析器（geometry @4096、metadata header 从 `0x3000` 扫 `0x414C5030`、extent `<QIQI`），子命令 `table/extract/list/dump` |
+| `out/re/mount_rom.sh` | 需要 root（`wsl -u root -- bash …`）：把 `vendor_a`/`odm_a`/`vendor_dlkm_a` 只读挂到 `/mnt/rom` |
+| `out/re/grab.sh` | 把 AF 相关 so/ko 拷到 `out/re/rom/`（82 MB） |
+| `out/re/STOCK_AF_ANALYSIS.md` | **逆向报告**（360 行）：架构/搜索策略/可调参数/DW9800V 协议/不可复刻部分/12 条可落地建议 |
+
+分区是 **EROFS**（`erofs-utils 1.7.1` 已装，`dump.erofs --ls`）。关键结论：
+
+- **算法**：`lib3a.af.core.so`（只导出 `af_Init/af_Process/af_Finalize`）；**策略/状态机**：
+  `libcam.afmgr.so`（`AfMgr::UpdateState/triggerAF/checkAutoFocus`）；**唯一动镜头的地方**：
+  `libcam.hal3a.lensdrv.so` 的 `VCMDrv::SetFocusPosition(int)` ⇒ 一条 `VIDIOC_S_CTRL`
+  （`0xC008561C`，`V4L2_CID_FOCUS_ABSOLUTE`）⇒ 内核侧驱动把 16-bit DAC 写进寄存器 `0x03`
+  （`i2c_smbus_write_word_data(client, 3, bswap16(val))`）：**内核里完全没有 AF 算法**。
+  （更正我们早先的笔记：正常路径写的是 `pos`，`pos-1` 只出现在"快速/重试"路径；位置与上次相同时它**短路不发 ioctl**。）
+- **搜索**：粗扫 → 细扫，靠 FV 爬坡、下降即反向、到边界停、无峰值则跑完全程、步数有上限；全量扫只是 debug override。
+- **不乱对焦**靠三道闸门：AE 变化（`caf_ev_diff_req`/`caf_evdiff_x1000`）+ 场景稳定（`AEstable`/scene stable）+ 陀螺仪静止，
+  外加**暗光抑制搜索**（`disableSeekLowLv`/`KeepLVDiff`）：这正是它不"抽"的原因。
+- **自适应镜头稳定**（`[AdpComp]`，用 `pixel_in_line`/`pixel_clk` 算镜头行程 + 读出时间）⇒ FV 只在镜头到位**且下一帧读出后**才可信。
+  （我们的等价物是 `CAMCAP_AF_SKIP` 丢弃转换帧。）
+- **park**：关机时 16 步 × ~9 ms 降到 0（0 = 无穷远端）⇒ §20.2 的 `park` 就是照这个写的。
+- **拿不到的**：所有数值调参在 `DataSet/SQLiteModule/db/af/ParameterDB_af.db`（vendor 分区里没有）、NVRAM
+  与每颗 sensor 的 `*_tuning.so` 里那个二进制 `RAWSensorInfo` blob；`AfMgr::getMin/MaxLensPos()` 是**返回 0 的桩函数**，
+  真实量程由 tuning 上传（`af_dac_inf`/`af_dac_marco`/`af_dac_min`/`af_dac_max` + 距离表）。
+- **不可复刻**：FV 本身来自 MTK ISP/DIP 统计块（`lib3a.stat.so`）、PDAF/Hybrid、33/40 MB 的 AI-assist 模型、FDAF/AISEG、
+  热标定与变焦同步。**我们能抄的是纯对比度 AF 的那部分。**
+
+### 20.5 四颗相机谁有对焦马达：只有主摄
+
+用户要求"其他几个头的对焦也做了"，但**硬件上没有**：两条独立证据：
+
+| 相机 | 传感器 | 执行器 | 证据 |
+|---|---|---|---|
+| 主摄 (port2) | IMX582 | **DW9800V @0x0c** | 原厂 DT 唯一的 `camera_af_main@0c`（`i2c@11d05000`，唯一带 `afvdd`）；原理图唯一 AF 网络 `CAMWM_AF_2P8`；实机 bus10 上同时有 `0x0c`(VCM, id `0xeb`)/`0x10`(IMX582)/`0x51`(EEPROM) |
+| 超广角 (port1) | S5K4H7 | 无（固定焦点） | DT `sensor3@2d` 无执行器/无 afvdd；原理图只有 `CAMU_AVDD_2P8`/`CAMU_MCLK`/`CAMU_RSTN` |
+| 微距 (port3) | GC02M1 | 无（固定焦点） | DT `sensor2@37` 无执行器/无 afvdd；原理图只有 `CAMM_*` |
+| 前摄 (port0) | IMX596 | 无（固定焦点） | DT `sensor1@10` 无执行器/无 afvdd；原理图只有 `CAMF_*` |
+
+（`TXVCM` 是射频网络，无关。）原厂自己对这些 sensor 走的就是固定焦点路径：
+`libcamera.customaf.so` 的 `ForceEnableFVInFixedFocus(int)` ⇒ `AfMgr` 把整个目标组当一个 FV 窗口、AF 模式设 EDOF、
+**永不移动镜头**。所以这三颗要做的不是"补对焦"，而是"承认它们是固定焦距"。
+
+### 20.6 诚实清单
+
+- **§20.1 的饱和路径没能在真机上复现**：那一晚房间太暗（`y=15`，raw ≈ 14），离饱和门槛（raw ≈ 435）差 30 倍，
+  而且手机**没有任何可控光源**（`/sys/class/leds/` 为空，也没有 v4l2 flash 节点）⇒ 无法在设备上制造"正常照明"。
+  证据是**算术等价性**（`scripts/check_af_metric.py` 逐行转写驱动的表达式）＋用户的现象描述完全吻合。
+  唯一的真机间接证据是修复后暗房度量 546–560‰ 而阈值 20‰。
+- 原厂的**数值**全部拿不到（§20.4 末），我们的步长/阈值/延时仍是自己凑的。
+- **DAC 0 是无穷远端**（原厂 park 到 0 + 我们实测"0.4 m 清楚、≥0.5 m 糊"）⇒ 但**没有 OTP 标定**，
+  `af_min/af_max` 仍是 0/1023 的全量程，不是这颗模组的标定区间。
+- EEPROM（0x51）里有两段像"镜头 DAC 位置表"的 16-bit 序列（≈213–501 与 ≈878–994），但**布局 UNKNOWN**，
+  没有原厂解析器 ⇒ 没有采用。
+
+### 20.7 新增/相关工具
+
+| 脚本 | 用途 |
+|---|---|
+| `scripts/check_af_metric.py` | 离机复算新旧对焦度量随 raw 电平的变化（§20.1 的表） |
+| `out/re/lp.py` · `out/re/mount_rom.sh` · `out/re/grab.sh` | HyperOS super.img 的 liblp 解析/挂载/取证 |
+| `out/re/STOCK_AF_ANALYSIS.md` | 原厂 AF 栈逆向报告（含 12 条可落地建议） |
+| `out/re/zz_af2.sh` · `out/re/zz_af2_run.sh` | AF v2 行为验收（90 s 搜索/抖动计数） |
+| `out/re/zz_park.sh` · `out/re/zz_push_run.sh` | park（命令行 + 卸载路径）验收 / 通用推送 |
+
+
+
 

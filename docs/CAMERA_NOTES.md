@@ -1625,4 +1625,52 @@ mean |dY| / Laplacian 方差 / mean |Laplacian| ⇒ **三个指标都在 512 取
 细节见 [docs/V4L2_CAMERA.md](V4L2_CAMERA.md) §19。
 
 
+## 23. ★★★ 2026-10-08 深夜 XII：**对焦指标在正常照明下饱和** + 原厂 AF 逆向 + 四摄只有主摄有马达
+
+用户报：「偶尔对焦很频繁，手没动都对，有时又死活不对焦，比如在场景中没有文字的情况下不对焦」，
+并要求"其他几个头的对焦也做了"和"逆向原厂相机对焦"。
+
+**★ 根因（两条症状同一个）**：bin=2 预览路径的对焦度量是**线性灰度**并在 255 饱和
+（`clamp((77r+150g+29b)>>8, 0, 255)`）。raw 电平超过 ~435（正常照明）时两个样本都钳到 255 ⇒ `fv=0`
+⇒ 判"平坦"、**永远不聚焦**；同时 `best_metric` 恒 0 ⇒ 每 12 帧重扫一次 ⇒ **"手没动也对个没完"**。
+bin=1 满尺寸路径一直用 gamma 后的绿 ⇒ 同一场景两条路径结论不同 = 用户说的"有时行有时不行"。
+`scripts/check_af_metric.py` 复算：旧度量在 raw 300/600/1200/2400/3600 上全是 **0.0**（120 时 10229.8），
+新度量（对比度千分比）是 217/127/91.5/74.5。
+
+**修复**：`cam_luma8()` → `cam_metric_px(g) = cam_lut_g[min(g,4095)]`（gamma 绿、不饱和、不带 WB 增益），
+两个站点统一；`cam_af_metric()` 改成 **`(fv*1000)/fv_y`**（对比度千分比，曝光不变）＋近黑守卫
+`CAMCAP_AF_MIN_LEVEL=6`；`af_floor` 默认 **200 → 20**；**抖动退避**（守住翻倍、上限 3000 帧≈100 s、
+赢了复位、不跨 AE 台阶测量、`af` 行加 `per=`）；`CAMCAP_AF_RESCAN_FRAMES` 12 → 30；`scans` 与
+`wobbles` 分开计数；新增 `cam_vcm_park()`（16 步 × `usleep_range(8400,9400)` 降到 0 = 原厂
+`dw9800v_power_off()` 的做法），模块 `__exit` 与 `/proc/camcap park` 都会调用。
+
+**实测**（917064 B，暗房，`out/re/zz_af2.sh`）：90 s 内 **1 次搜索**（旧 ~11 次）、**3 次抖动**且间隔
+240→480→960→1920 帧翻倍、33.1 fps、crashes 0、暗房 `metric=546–560‰`。park：推流中 `pos=640→0`（rc=0）；
+`af pos 768` 后 `rmmod` ⇒ dmesg `VCM parked at 0 (infinity end)`，`unregistered`→`parked` 459 ms（48 步）。
+
+**原厂 AF 逆向**（`out/re/STOCK_AF_ANALYSIS.md`，360 行）：算法在 `lib3a.af.core.so`、状态机在
+`libcam.afmgr.so`、**唯一动镜头的是 `libcam.hal3a.lensdrv.so` 的 `VCMDrv::SetFocusPosition`**
+（一条 `VIDIOC_S_CTRL` 写 `V4L2_CID_FOCUS_ABSOLUTE`）⇒ 内核侧把 16-bit DAC 写寄存器 `0x03`；
+搜索 = 粗扫→细扫 + 下降反向 + 边界停 + 无峰值跑完全程 + 步数上限；**不乱对焦靠三道闸门**
+（AE 变化 + 场景稳定 + 陀螺仪静止）＋暗光抑制搜索；自适应镜头稳定用 `pixel_in_line/pixel_clk`
+（我们的等价物是丢弃转换帧）。**拿不到**：所有数值调参（`ParameterDB_af.db`/NVRAM/`*_tuning.so` 里的
+`RAWSensorInfo` blob），`AfMgr::getMin/MaxLensPos()` 是返回 0 的桩函数。**不可复刻**：FV 来自 MTK ISP/DIP
+统计块、PDAF/Hybrid、33/40 MB AI 模型、FDAF/AISEG、热标定。
+
+**★ 四摄只有主摄有对焦马达**（用户要求"其他几个头也做对焦"的答复）：原厂 DT 里唯一的执行器是
+`camera_af_main@0c`（`i2c@11d05000`，唯一带 `afvdd`），原理图里唯一的 AF 电源网络是 `CAMWM_AF_2P8`；
+超广角/微距/前摄只有各自的 AVDD/MCLK/RSTN。实机 bus10 上同时有 `0x0c`(VCM, id `0xeb`)/`0x10`/`0x51`。
+原厂对这三颗走 `ForceEnableFVInFixedFocus()`（整个目标组当一个 FV 窗口、AF 模式 EDOF、永不动镜头）
+⇒ 它们是**固定焦距**，要做的不是补对焦。
+
+**诚实清单**：① 饱和路径**没能在真机复现**（房间太暗：`y=15` ⇒ raw ≈14，离门槛 435 差 30 倍；
+手机 `/sys/class/leds/` 为空、无 v4l2 flash 节点 ⇒ 没有任何可控光源），证据是**算术等价**
+（`check_af_metric.py` 逐行转写）+ 用户描述吻合；② 原厂的数值全拿不到，我们的步长/阈值仍是自己凑的；
+③ `af_min/af_max` 仍是 0/1023 全量程，没有 OTP 标定；④ EEPROM 里两段像 DAC 位置表的序列
+（≈213–501 / ≈878–994）布局 UNKNOWN，没采用。
+
+细节见 [docs/V4L2_CAMERA.md](V4L2_CAMERA.md) §20。
+
+
+
 
