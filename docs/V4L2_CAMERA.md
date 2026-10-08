@@ -1795,3 +1795,49 @@ if (m * 100 < cam_af.hold_ref * CAMCAP_AF_RESCAN_PCT)	/* 新：和自己比 */
 
 
 
+
+
+## 23. 2026-10-09 凌晨 XV：**帧间隔直方图的桶改成相对标称周期**（30 fps 模式不再被全判"掉帧"）
+
+动机：`dist` 的四个桶（clean <32 ms / late 32–40 ms / slip 40–58 ms / lost ≥58 ms）是**按我们缩短过 VTS 的预览模式**
+（VTS 3300 ⇒ 30.2 ms 周期）定的绝对值。于是用**厂商 VTS 的 30 fps 模式**（normal_video 4000×2256，VTS 3658 ⇒ 33.33 ms 周期）时，
+**每一个健康帧都落进 `late(32–40 ms)`**： §21.3 那张矩阵里"149 帧全 late"就是这么来的（当时已如实标注这是口径问题）。
+
+改法（`src/cam_cap.c`，`cam_per_hist_add()`）：
+
+```c
+u64 nom = cam_mode_fps ? 100000000ULL / cam_mode_fps : 30500ULL;	/* 10M/fps_x100 = nominal period, us */
+u64 us  = per / 1000ULL;
+
+if (us * 100 < nom * 115)		/* < 1.15x */
+	...per_hist[0]++;		/* clean */
+else if (us * 100 < nom * 160)		/* 1.15 - 1.6x */
+	...per_hist[1]++;		/* late  */
+else if (us * 100 < nom * 220)		/* 1.6 - 2.2x */
+	...per_hist[2]++;		/* slip  */
+else
+	...per_hist[3]++;		/* lost  */
+```
+
+`cam_mode_fps` 是既有全局（`.fps_x100`，由 `cam_mode_geometry()` 在每次 `VIDIOC_S_FMT` 切模式/切分辨率时设置），
+所以桶自动跟着当前模式走；`dist` 行现在把标称周期也打出来：
+
+```
+dist : clean(<1.15x)=78 late(1.15-1.6x)=0 slip(1.6-2.2x)=2 lost(>=2.2x)=0  nom=30066us
+```
+
+### 23.1 同场 A/B（`out/re/zz_dist.sh`）
+
+两次都是 80 帧、同一 `--set-fmt-video=4000x2256,YUYV --set-parm=30` 配置；旧构建是 `/root/cam_cap_v2.ko`（带绝对桶），新构建是 `/root/cam_cap_dist.ko`。
+
+| 模式（标称周期） | 旧构建（绝对桶） | 新构建（相对桶） |
+|---|---|---|
+| normal_video 4000×2256 @30（**33333 µs**） | `clean(<32ms)=3 late(32-40ms)=77` ✗ | **`clean(<1.15x)=80 late=0 slip=0 lost=0`** ✓ |
+| preview 2000×1500（**30066 µs**） | — | `clean=79 late=0 slip=1 lost=0` ✓ |
+
+### 23.2 诚实清单
+
+- 改的是**报表口径**，不是帧率本身：`timing`/`avg` 的 period 数字在改前后完全一样（33333 µs 对 33.3 ms 的周期本来就是对的）。
+- `lost` 仍要求 ≥2.2× 标称周期，所以 30 fps 模式下偶发的 ≥58 ms hiccup 要到 ~73 ms 才会被记成 lost
+ ： 想看真实抖动请直接看 `timing period` / `avg period`（§21.2 的 4K60 结论就是这么得出的）。
+- §22.7 那次 12 000 帧长跑用的是**旧口径**，它那 153 个 `late` 里有一部分其实是 32–34.6 ms 的健康帧。

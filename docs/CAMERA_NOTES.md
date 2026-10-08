@@ -1753,3 +1753,18 @@ MemFree 9.41 → 9.24 GB、crashes 0；③ 相机仓 **9fa42e8** / 内核 **fbad
 
 
 
+
+
+## 26. ★★ 2026-10-09 凌晨 XV：**帧间隔直方图的桶改成相对标称周期**
+
+- 症状：用厂商 VTS 的 30 fps 模式（normal_video 4000×2256，周期 33.33 ms）推 80 帧，`dist` 报
+  `clean(<32ms)=3 late(32-40ms)=77` ✗： 而同一时刻 `timing fps=30.03 period=33290us`、`avg fps=30.35`，帧率明明是满的。
+- 根因：四个桶是**绝对值**，当时按我们缩短过 VTS 的预览模式（VTS 3300 ⇒ 30.2 ms）定的；一换成厂商 VTS 的 30 fps 模式（33.33 ms），
+  健康帧就整批落进 `late(32–40 ms)`。
+- 修法：`cam_per_hist_add()` 改成按标称周期分档： `nom = 100000000 / cam_mode_fps`（10 M / `fps_x100` = 周期 µs），
+  判据 `us*100 < nom*115`（clean）/ `< nom*160`（late）/ `< nom*220`（slip）/ else（lost）；缺失 `cam_mode_fps` 时退回 30500 µs；
+  `dist` 行末尾打印 `nom=%uus`；桶自动跟随 `cam_mode_geometry()` 设的当前模式（`VIDIOC_S_FMT` 或开机默认模式）。
+- A/B（`out/re/zz_dist.sh`，各 80 帧）：旧构建 `clean=3 late=77` ⇒ 新构建 **`clean=80 late=0 slip=0 lost=0 nom=33333us`** ✓；
+  预览模式新构建 `clean=79 late=0 slip=1 lost=0 nom=30066us`（那次 slip 是真实的 1.6–2.2× 抖动）。
+- 口径提醒：`lost` 现在要 ≥2.2× 标称周期才计，30 fps 模式下 ≥73 ms 才算： 判 4K60 那种稀疏 hiccup 要看 `timing period`。
+- 构建：919696 B，md5 `f7d3a4792a52ea2068302193cf9863c5`；唯一告警是既有的 `camcap_info_read` 栈帧 2272 B（16 KB 内核栈上无害）。
