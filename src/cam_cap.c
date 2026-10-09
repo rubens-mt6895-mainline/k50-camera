@@ -1106,6 +1106,9 @@ static void cam_band_sync(dma_addr_t phys, size_t size, unsigned int first,
 			  unsigned int last);
 static int cam_mode_match(unsigned int w, unsigned int h, unsigned int bin,
 			  unsigned int fps_x100);
+static void cam_mode_geometry(const struct cam_sensor_mode *m,
+			      unsigned int bin);
+static const struct cam_sensor_mode *cam_mode_get(int idx);
 static int cam_mode_program(int idx);
 static int cam_mode_select(const char *name, unsigned int bin);
 static unsigned int cam_lut_ver;
@@ -2565,6 +2568,257 @@ struct cam_v4l2_ctx {
 /* the single instance; NULL until the V4L2 device is registered */
 static struct cam_v4l2_ctx *cam_v4l2;
 
+/* this phone has four cameras */
+#define CAMCAP_MAX_CAM	4
+
+/*
+ * ---- the four cameras ----
+ *
+ * All four sit behind CAM_MUX 3 into the same CAMSV, so only one of them can
+ * stream at a time; the extra video nodes exist so that an application can
+ * pick one.  The front, ultrawide and macro cameras have no sensor driver
+ * here: their rails, MCLK, reset, register tables and D-PHY timing are
+ * brought up from userspace (scripts/zz_front_cap.sh, zz_uw2.sh,
+ * zz_macro_cap.sh) before the driver is used.  That is also why such a node
+ * reports exactly the one raw frame bring-up configured - there is no table
+ * to switch it with - and why its AE, AWB and focus are left alone: the
+ * governor would be writing registers of a sensor it does not know.
+ */
+struct cam_board {
+	const char	*name;
+	const char	*card;
+	unsigned int	route_intf;	/* SENINF interface = 2 x CSI port */
+	unsigned int	hsize;		/* raw frame bring-up configured */
+	unsigned int	vsize;
+	unsigned int	fps_x100;
+	unsigned int	exp_max;
+	bool		sensor_drv;	/* this driver writes the sensor */
+	bool		ae;
+	bool		awb;
+	bool		af;
+	const struct cam_sensor_mode *modes;
+	unsigned int	nmodes;
+};
+
+/* one mode per auxiliary camera: the frame its bring-up configured */
+static struct cam_sensor_mode cam_aux_modes[CAMCAP_MAX_CAM] = {
+	{ 0 },
+	{
+		.name = "IMX596 2592x1952", .hsize = 2592, .vsize = 1952,
+		.fps_x100 = 3000, .exp_max = 1900, .sensor_bin = 1,
+		.comment = "front camera, configured from userspace",
+	},
+	{
+		.name = "S5K4H7 3264x2448", .hsize = 3264, .vsize = 2448,
+		.fps_x100 = 3000, .exp_max = 2400, .sensor_bin = 1,
+		.comment = "ultrawide camera, configured from userspace",
+	},
+	{
+		.name = "GC02M1 1600x1200", .hsize = 1600, .vsize = 1200,
+		.fps_x100 = 3000, .exp_max = 1150, .sensor_bin = 1,
+		.comment = "macro camera, configured from userspace",
+	},
+};
+
+static struct cam_board cam_boards[CAMCAP_MAX_CAM] = {
+	{
+		.name = "IMX582",
+		.card = "MT6895 CAMSV1 (IMX582)",
+		.sensor_drv = true, .ae = true, .awb = true, .af = true,
+		.modes = cam_imx582_modes, .nmodes = CAMCAP_IMX582_NMODES,
+	},
+	{
+		.name = "IMX596",
+		.card = "MT6895 CAMSV1 (IMX596 front)",
+		.route_intf = 0, .hsize = 2592, .vsize = 1952,
+		.fps_x100 = 3000, .exp_max = 1900,
+		.modes = &cam_aux_modes[1], .nmodes = 1,
+	},
+	{
+		.name = "S5K4H7",
+		.card = "MT6895 CAMSV1 (S5K4H7 ultrawide)",
+		.route_intf = 2, .hsize = 3264, .vsize = 2448,
+		.fps_x100 = 3000, .exp_max = 2400,
+		.modes = &cam_aux_modes[2], .nmodes = 1,
+	},
+	{
+		.name = "GC02M1",
+		.card = "MT6895 CAMSV1 (GC02M1 macro)",
+		.route_intf = 6, .hsize = 1600, .vsize = 1200,
+		.fps_x100 = 3000, .exp_max = 1150,
+		.modes = &cam_aux_modes[3], .nmodes = 1,
+	},
+};
+
+/*
+ * How many cameras to expose as video nodes.  One is the default and keeps
+ * the driver exactly as it has always been: a single /dev/video0 on the main
+ * camera.  Raised, the auxiliary cameras appear as extra nodes; they share
+ * the one capture engine, so only one of them can stream at a time and the
+ * others answer -EBUSY until it stops.
+ */
+static unsigned int cam_nodes = 1;
+module_param(cam_nodes, uint, 0444);
+MODULE_PARM_DESC(cam_nodes, "cameras to expose as video nodes (1..4, default 1)");
+
+/* the auxiliary nodes; node 0 is the engine's own device */
+struct cam_aux_node {
+	struct video_device	vdev;
+	struct vb2_queue	queue;
+	struct v4l2_pix_format	pix;
+	const struct cam_board	*board;
+};
+
+static struct cam_aux_node cam_aux[CAMCAP_MAX_CAM - 1];
+static unsigned int cam_aux_count;
+
+/* the board the engine is set up for, and the mode table that goes with it */
+static const struct cam_board *cam_active = &cam_boards[0];
+static const struct cam_sensor_mode *cam_modes = cam_imx582_modes;
+static unsigned int cam_nmodes = CAMCAP_IMX582_NMODES;
+
+/*
+ * Node 0's own geometry.  The capture engine keeps one global set of
+ * geometry variables, and an auxiliary node selects its own board (and its
+ * own frame size) whenever it starts streaming or takes an S_FMT.  An
+ * application that streams node 0 without an S_FMT - v4l2-ctl
+ * --stream-mmap does exactly that - would otherwise find the engine still
+ * pointed at whichever auxiliary camera ran last.  Remember what node 0
+ * asked for and put it back when node 0 starts.
+ */
+static int cam_engine_mode_idx = -1;
+static unsigned int cam_engine_bin = 2;
+static unsigned int cam_engine_hsize;
+static unsigned int cam_engine_vsize;
+static unsigned int cam_engine_out_w;
+static unsigned int cam_engine_out_h;
+
+/* the board a file handle belongs to */
+static const struct cam_board *cam_board_of(struct file *file)
+{
+	unsigned int i;
+
+	if (!file || !cam_v4l2)
+		return cam_active;
+	if (video_devdata(file) == &cam_v4l2->vdev)
+		return &cam_boards[0];
+	for (i = 0; i < cam_aux_count; i++)
+		if (video_devdata(file) == &cam_aux[i].vdev)
+			return cam_aux[i].board;
+
+	return &cam_boards[0];
+}
+
+/* the format of a node that is not the engine's own: NULL for node 0 */
+static struct v4l2_pix_format *cam_node_pix(struct file *file)
+{
+	unsigned int i;
+
+	if (!file || !cam_v4l2)
+		return NULL;
+	for (i = 0; i < cam_aux_count; i++)
+		if (video_devdata(file) == &cam_aux[i].vdev)
+			return &cam_aux[i].pix;
+
+	return NULL;
+}
+
+/*
+ * Every node drives the same engine, so a device that is streaming on any of
+ * them cannot be reconfigured (s_fmt and s_parm), and a second node cannot be
+ * started: the CAMSV route, the capture buffer and the converter are shared.
+ */
+static bool cam_any_busy(void)
+{
+	unsigned int i;
+
+	if (!cam_v4l2)
+		return false;
+	if (vb2_is_busy(&cam_v4l2->queue))
+		return true;
+	for (i = 0; i < cam_aux_count; i++)
+		if (vb2_is_busy(&cam_aux[i].queue))
+			return true;
+
+	return false;
+}
+
+/*
+ * Point the engine at a board.  route_mux, cammux and the data type stay as
+ * the module parameters set them: all four cameras use the same ones.  The
+ * route itself is programmed once per boot (route_once), so a camera change
+ * has to invalidate it or the new camera would never reach CAMSV.
+ */
+static void cam_board_select(const struct cam_board *b)
+{
+	cam_active = b;
+	cam_modes = b->modes;
+	cam_nmodes = b->nmodes;
+	if (b->route_intf != route_intf) {
+		route_intf = b->route_intf;
+		cam_route_done = false;
+	}
+	if (b->hsize && b->vsize) {
+		exp_hsize = b->hsize;
+		exp_vsize = b->vsize;
+	}
+}
+
+/* remember what node 0 runs, so a later start can put the engine back on it */
+static void cam_engine_remember(void)
+{
+	cam_engine_mode_idx = cam_mode_idx;
+	cam_engine_bin = cam_bin;
+	cam_engine_hsize = exp_hsize;
+	cam_engine_vsize = exp_vsize;
+	cam_engine_out_w = out_width;
+	cam_engine_out_h = out_height;
+}
+
+/*
+ * Put the engine back on node 0's camera.  cam_bin, cam_src_*, out_width,
+ * out_height, exp_max and exp_hsize/exp_vsize are all engine globals shared
+ * with the auxiliary nodes, so node 0 has to rebuild them before it streams -
+ * including when the application never calls s_fmt, which is what
+ * "v4l2-ctl --stream-mmap" does.  Without this, streaming node 0 right after
+ * an auxiliary camera shows that auxiliary camera's frames.
+ */
+static void cam_engine_restore(void)
+{
+	cam_board_select(&cam_boards[0]);
+	if (cam_engine_hsize && cam_engine_vsize) {
+		exp_hsize = cam_engine_hsize;
+		exp_vsize = cam_engine_vsize;
+	}
+	if (cam_engine_mode_idx >= 0) {
+		cam_mode_geometry(cam_mode_get(cam_engine_mode_idx),
+				  cam_engine_bin);
+		return;
+	}
+	/*
+	 * The load geometry matched no table, so there is no table to replay:
+	 * rebuild the source geometry from the module parameters the same way
+	 * cam_cap_init() did.
+	 */
+	cam_bin = cam_engine_bin;
+	cam_src_w = ALIGN(exp_hsize, 2);
+	cam_src_h = ALIGN(exp_vsize, 2);
+	cam_src_stride = v4l2_src_stride ? v4l2_src_stride : cam_src_w * 3 / 2;
+	out_width = cam_src_w / cam_bin;
+	out_height = cam_src_h / cam_bin;
+}
+
+/* the frame rate an application should be told about a node */
+static unsigned int cam_node_fps_x100(const struct cam_board *b)
+{
+	if (b == cam_active && cam_mode_fps)
+		return cam_mode_fps;
+	if (b->nmodes)
+		return b->modes[0].fps_x100;
+
+	return 0;
+}
+
 /*
  * Per-frame timing for /proc/camcap_info, in the same key/value shape as the
  * rest of that file.  arm is the hardware wait plus the register sequence, conv
@@ -3006,6 +3260,14 @@ static void cam_sensor_apply(void)
 
 	if (!sensor_ctl)
 		return;
+	/*
+	 * Never write the exposure/gain registers of a camera that was brought
+	 * up from userspace: the values this driver holds belong to the IMX582
+	 * register map and would land in whatever register the host offset
+	 * happens to mean on IMX596, S5K4H7 or GC02M1.
+	 */
+	if (!cam_active->sensor_drv)
+		return;
 	if (cam_sensor_valid &&
 	    cam_sensor_hw.exposure == s.exposure &&
 	    cam_sensor_hw.again == s.again &&
@@ -3122,6 +3384,9 @@ static int cam_vcm_write(unsigned int reg, const u8 *data, unsigned int n)
 	};
 	int ret;
 
+	/* only the main camera has a focus actuator; the others are fixed */
+	if (!cam_active->sensor_drv)
+		return 0;
 	if (!cam_i2c_adap || n > sizeof(buf) - 1)
 		return -EINVAL;
 	buf[0] = reg & 0xff;
@@ -4073,8 +4338,13 @@ static void cam_isp_governor(const struct cam_stats *in)
 	if (!st.count)
 		return;
 
-	/* grey world: drive the corrected channel means towards each other */
-	if (cam_awb_auto && st.mean_g >= awb_min_level &&
+	/*
+	 * Grey world: drive the corrected channel means towards each other.
+	 * The auxiliary cameras are left alone: the CFA phase of those sensors
+	 * is not known here, and the userspace bring-up that produced the
+	 * verified frames ran them with AWB off.
+	 */
+	if (cam_awb_auto && cam_active->awb && st.mean_g >= awb_min_level &&
 	    st.mean_r && st.mean_b) {
 		unsigned int shift = awb_rate > 8 ? 8 : awb_rate;
 		unsigned int div = 1u << shift;
@@ -4144,7 +4414,7 @@ static void cam_isp_governor(const struct cam_stats *in)
 	 *    metric it compares across lens positions is only meaningful if the
 	 *    exposure is not moving underneath it.
 	 */
-	if (cam_ae_auto) {
+	if (cam_ae_auto && cam_active->ae) {
 		bool frozen = cam_af_scanning();
 
 		if (!cam_ae_mean_s)
@@ -4180,7 +4450,9 @@ static void cam_isp_governor(const struct cam_stats *in)
 		cam_ae_mean_s = 0;
 	}
 
-	cam_af_step(&st);
+	/* focus belongs to the main camera; the other three are fixed focus */
+	if (cam_active->af)
+		cam_af_step(&st);
 }
 
 /* One byte of YUV, clamped: chroma scaling can push U/V out of range. */
@@ -5713,7 +5985,59 @@ static void cam_vb2_buf_queue(struct vb2_buffer *vb)
 static int cam_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct cam_v4l2_ctx *c = vb2_get_drv_priv(q);
+	unsigned int i;
 	int ret;
+
+	/*
+	 * With more than one node the engine's globals - the board, the source
+	 * geometry, the output size, the exposure limit - have to belong to
+	 * the node that is about to stream.  s_fmt sets them when an
+	 * application calls it, but "v4l2-ctl --stream-mmap" queues and
+	 * streams without ever calling s_fmt, so node 0 gets its own camera
+	 * and geometry back here and an auxiliary node gets its board and its
+	 * advertised frame.  With the default cam_nodes=1 none of this runs
+	 * and the single-node behaviour is unchanged.
+	 */
+	if (cam_nodes > 1) {
+		if (q == &c->queue) {
+			/*
+			 * Never re-route the engine from here.  The CSI route,
+			 * the CAM_MUX source and the receiver clocks belong to
+			 * the userspace bring-up of whichever camera is up.  On
+			 * 2026-10-09 a stream on node 0 right after the macro
+			 * camera had streamed - which took the engine back to
+			 * the main camera's route from inside arm - hung this
+			 * SoC hard (no ssh, no serial echo, power cycle
+			 * required).  If the engine sits on another board, say
+			 * so and refuse; userspace re-arms that camera first,
+			 * and "echo mode <name> > /proc/camcap" re-selects the
+			 * main camera's table and route after its own bring-up.
+			 */
+			if (cam_active != &cam_boards[0]) {
+				pr_err("v4l2: node 0 refused: the engine is on %s (bring that camera's own path back, then echo mode <name> > /proc/camcap)\n",
+				       cam_active->name);
+				return -EBUSY;
+			}
+			cam_engine_restore();
+		} else {
+			for (i = 0; i < cam_aux_count; i++) {
+				unsigned int abin;
+
+				if (q != &cam_aux[i].queue)
+					continue;
+				/* the node's advertised size says which bin it uses */
+				abin = cam_aux[i].pix.width &&
+				       cam_aux[i].pix.width * 2 ==
+					       cam_aux[i].board->hsize ? 2 : 1;
+				cam_board_select(cam_aux[i].board);
+				cam_mode_geometry(&cam_aux[i].board->modes[0],
+						  abin);
+				pr_info("v4l2: %s streaming without s_fmt, %ux%u\n",
+					cam_aux[i].board->name, out_width,
+					out_height);
+			}
+		}
+	}
 
 	/*
 	 * Push whatever userspace set before streamon through the control
@@ -5852,10 +6176,10 @@ static const struct vb2_ops cam_vb2_ops = {
  */
 static const struct cam_sensor_mode *cam_mode_get(int idx)
 {
-	if (idx < 0 || idx >= CAMCAP_IMX582_NMODES)
+	if (idx < 0 || idx >= (int)cam_nmodes)
 		return NULL;
 
-	return &cam_imx582_modes[idx];
+	return &cam_modes[idx];
 }
 
 /*
@@ -5880,8 +6204,9 @@ static bool cam_mode_fits(const struct cam_sensor_mode *m)
  * rate, otherwise the closest wins, which is how VIDIOC_S_PARM chooses
  * between the 1080p120 and 1080p240 modes.
  */
-static int cam_mode_match(unsigned int w, unsigned int h, unsigned int bin,
-			  unsigned int fps_x100)
+static int cam_mode_match_on(const struct cam_board *b, unsigned int w,
+			     unsigned int h, unsigned int bin,
+			     unsigned int fps_x100)
 {
 	int best = -1;
 	unsigned int best_diff = 0;
@@ -5890,8 +6215,8 @@ static int cam_mode_match(unsigned int w, unsigned int h, unsigned int bin,
 	if (bin != 1 && bin != 2)
 		return -EINVAL;
 
-	for (i = 0; i < CAMCAP_IMX582_NMODES; i++) {
-		const struct cam_sensor_mode *m = &cam_imx582_modes[i];
+	for (i = 0; i < (int)b->nmodes; i++) {
+		const struct cam_sensor_mode *m = &b->modes[i];
 		unsigned int diff;
 
 		if (m->hsize / bin != w || m->vsize / bin != h)
@@ -5916,6 +6241,13 @@ static int cam_mode_match(unsigned int w, unsigned int h, unsigned int bin,
 	}
 
 	return best;
+}
+
+/* match against the mode table of the board the engine is set up for */
+static int cam_mode_match(unsigned int w, unsigned int h, unsigned int bin,
+			  unsigned int fps_x100)
+{
+	return cam_mode_match_on(cam_active, w, h, bin, fps_x100);
 }
 
 /* the geometry the converter and the CAMSV registers work from */
@@ -6094,6 +6426,20 @@ static int cam_mode_program(int idx)
 		       cam_buf_size ? cam_buf_size : frame_bytes);
 		return -ENOSPC;
 	}
+	/*
+	 * An auxiliary camera was configured entirely from userspace (rails,
+	 * MCLK, reset, register tables, D-PHY timing), so a "mode switch" here
+	 * is only new converter geometry; replaying the IMX582 tables into it
+	 * would be writing a sensor we know nothing about.
+	 */
+	if (!cam_active->sensor_drv) {
+		cam_mode_idx = idx;
+		cam_sensor_valid = false;
+		pr_info("mode: %s %ux%u, %u.%02u fps (userspace bring-up, no replay)\n",
+			m->name, m->hsize, m->vsize,
+			m->fps_x100 / 100, m->fps_x100 % 100);
+		return 0;
+	}
 	if (!cam_i2c_get())
 		return -ENODEV;
 
@@ -6166,7 +6512,7 @@ static int cam_mode_select(const char *name, unsigned int bin)
 		pr_err("mode: no such mode '%s'\n", name);
 		return -ENOENT;
 	}
-	if (cam_v4l2 && vb2_is_busy(&cam_v4l2->queue)) {
+	if (cam_any_busy()) {
 		pr_err("mode: the device is streaming\n");
 		return -EBUSY;
 	}
@@ -6175,11 +6521,15 @@ static int cam_mode_select(const char *name, unsigned int bin)
 	/* every table in the generated header has an even output window */
 	bin = bin == 1 ? 1 : 2;
 
+	/* this command belongs to the main camera */
+	cam_board_select(&cam_boards[0]);
 	ret = cam_mode_program(i);
 	if (ret)
 		return ret;
 	cam_mode_geometry(&cam_imx582_modes[i], bin);
 	cam_ctrl_update_exp_max();
+	/* this command belongs to the main camera, so update node 0's geometry */
+	cam_engine_remember();
 	pr_info("mode: output %ux%u YUYV, bin %u, %u bytes/frame\n",
 		out_width, out_height, cam_bin, out_width * out_height * 2);
 
@@ -6192,7 +6542,7 @@ static int cam_vidioc_querycap(struct file *file, void *priv,
 			       struct v4l2_capability *cap)
 {
 	strscpy(cap->driver, "cam_cap", sizeof(cap->driver));
-	strscpy(cap->card, "MT6895 CAMSV1 (IMX582)", sizeof(cap->card));
+	strscpy(cap->card, cam_board_of(file)->card, sizeof(cap->card));
 	strscpy(cap->bus_info, "platform:cam_cap", sizeof(cap->bus_info));
 
 	return 0;
@@ -6227,7 +6577,12 @@ static void cam_fill_pix(struct v4l2_pix_format *pix)
 static int cam_vidioc_g_fmt(struct file *file, void *priv,
 			    struct v4l2_format *f)
 {
-	cam_fill_pix(&f->fmt.pix);
+	struct v4l2_pix_format *node = cam_node_pix(file);
+
+	if (node)
+		f->fmt.pix = *node;
+	else
+		cam_fill_pix(&f->fmt.pix);
 
 	return 0;
 }
@@ -6241,6 +6596,8 @@ static int cam_vidioc_g_fmt(struct file *file, void *priv,
 static int cam_vidioc_try_fmt(struct file *file, void *priv,
 			      struct v4l2_format *f)
 {
+	const struct cam_board *b = cam_board_of(file);
+	struct v4l2_pix_format *node = cam_node_pix(file);
 	struct v4l2_pix_format *pix = &f->fmt.pix;
 
 	/*
@@ -6255,8 +6612,8 @@ static int cam_vidioc_try_fmt(struct file *file, void *priv,
 
 	pix->pixelformat = V4L2_PIX_FMT_YUYV;
 	if (pix->width && pix->height &&
-	    (cam_mode_match(pix->width, pix->height, 1, 0) >= 0 ||
-	     cam_mode_match(pix->width, pix->height, 2, 0) >= 0)) {
+	    (cam_mode_match_on(b, pix->width, pix->height, 1, 0) >= 0 ||
+	     cam_mode_match_on(b, pix->width, pix->height, 2, 0) >= 0)) {
 		pix->field = V4L2_FIELD_NONE;
 		pix->bytesperline = pix->width * 2;
 		pix->sizeimage = pix->width * pix->height * 2;
@@ -6264,6 +6621,9 @@ static int cam_vidioc_try_fmt(struct file *file, void *priv,
 		pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
 		pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
 		pix->xfer_func = V4L2_XFER_FUNC_SRGB;
+	} else if (node) {
+		/* an auxiliary node has the one frame its bring-up configured */
+		*pix = *node;
 	} else {
 		cam_fill_pix(pix);
 	}
@@ -6280,13 +6640,15 @@ static int cam_vidioc_try_fmt(struct file *file, void *priv,
 static int cam_vidioc_s_fmt(struct file *file, void *priv,
 			    struct v4l2_format *f)
 {
-	struct cam_v4l2_ctx *c = video_drvdata(file);
+	const struct cam_board *b = cam_board_of(file);
+	struct v4l2_pix_format *node = cam_node_pix(file);
 	struct v4l2_pix_format *pix = &f->fmt.pix;
 	unsigned int w = pix->width, h = pix->height;
 	unsigned int bin;
 	int idx, ret = 0;
 
-	if (vb2_is_busy(&c->queue))
+	/* the engine is shared by every node, streaming or not */
+	if (cam_any_busy())
 		return -EBUSY;
 
 	if (pix->pixelformat && pix->pixelformat != V4L2_PIX_FMT_YUYV)
@@ -6298,31 +6660,50 @@ static int cam_vidioc_s_fmt(struct file *file, void *priv,
 
 	/* the current binning first, then the other one */
 	bin = cam_bin;
-	idx = cam_mode_match(w, h, bin, 0);
+	idx = cam_mode_match_on(b, w, h, bin, 0);
 	if (idx < 0) {
 		bin = bin == 1 ? 2 : 1;
-		idx = cam_mode_match(w, h, bin, 0);
+		idx = cam_mode_match_on(b, w, h, bin, 0);
 	}
 	if (idx < 0) {
 		/* no mode can produce this size: keep the frame */
-		cam_fill_pix(pix);
+		if (node)
+			*pix = *node;
+		else
+			cam_fill_pix(pix);
 		return 0;
 	}
 
 	mutex_lock(&cam_lock);
-	if (idx != cam_mode_idx)
+	cam_board_select(b);
+	/*
+	 * cam_mode_idx is the engine's global and an auxiliary s_fmt overwrites
+	 * it with its own (always 0) index, so node 0 has to compare against the
+	 * index it last programmed - otherwise re-selecting the main camera's
+	 * previous mode would skip the sensor table replay.
+	 */
+	if (b == &cam_boards[0]) {
+		if (idx != cam_engine_mode_idx)
+			ret = cam_mode_program(idx);
+	} else if (idx != cam_mode_idx) {
 		ret = cam_mode_program(idx);
+	}
 	if (!ret) {
-		cam_mode_geometry(&cam_imx582_modes[idx], bin);
+		cam_mode_geometry(&b->modes[idx], bin);
 		cam_ctrl_update_exp_max();
+		/* node 0's own geometry is what the engine restores on start */
+		if (b == &cam_boards[0])
+			cam_engine_remember();
 	}
 	mutex_unlock(&cam_lock);
 	if (ret)
 		return ret;
 
+	if (node)
+		cam_fill_pix(node);
 	cam_fill_pix(pix);
-	pr_info("v4l2: s_fmt %ux%u -> %s %ux%u, bin %u\n", w, h,
-		cam_imx582_modes[idx].name, out_width, out_height, cam_bin);
+	pr_info("v4l2: s_fmt %ux%u -> %s %s %ux%u, bin %u\n", w, h, b->name,
+		b->modes[idx].name, out_width, out_height, cam_bin);
 
 	return 0;
 }
@@ -6330,6 +6711,7 @@ static int cam_vidioc_s_fmt(struct file *file, void *priv,
 static int cam_vidioc_enum_framesizes(struct file *file, void *priv,
 				      struct v4l2_frmsizeenum *fsize)
 {
+	const struct cam_board *bd = cam_board_of(file);
 	struct {
 		unsigned int w, h;
 	} seen[CAMCAP_IMX582_NMODES * 2];
@@ -6339,12 +6721,12 @@ static int cam_vidioc_enum_framesizes(struct file *file, void *priv,
 	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 
-	for (i = 0; i < CAMCAP_IMX582_NMODES; i++) {
-		if (!cam_mode_fits(&cam_imx582_modes[i]))
+	for (i = 0; i < (int)bd->nmodes; i++) {
+		if (!cam_mode_fits(&bd->modes[i]))
 			continue;
 		for (b = 1; b <= 2; b++) {
-			unsigned int w = cam_imx582_modes[i].hsize / b;
-			unsigned int h = cam_imx582_modes[i].vsize / b;
+			unsigned int w = bd->modes[i].hsize / b;
+			unsigned int h = bd->modes[i].vsize / b;
 			unsigned int k;
 
 			for (k = 0; k < n; k++)
@@ -6382,21 +6764,22 @@ static unsigned int cam_gcd(unsigned int a, unsigned int b)
 static int cam_vidioc_enum_frameintervals(struct file *file, void *priv,
 					  struct v4l2_frmivalenum *fival)
 {
+	const struct cam_board *bd = cam_board_of(file);
 	unsigned int k = 0;
 	int i, b;
 
 	if (fival->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 
-	for (i = 0; i < CAMCAP_IMX582_NMODES; i++) {
-		if (!cam_mode_fits(&cam_imx582_modes[i]))
+	for (i = 0; i < (int)bd->nmodes; i++) {
+		if (!cam_mode_fits(&bd->modes[i]))
 			continue;
 		for (b = 1; b <= 2; b++) {
-			unsigned int fps = cam_imx582_modes[i].fps_x100;
+			unsigned int fps = bd->modes[i].fps_x100;
 			unsigned int g;
 
-			if (cam_imx582_modes[i].hsize / b != fival->width ||
-			    cam_imx582_modes[i].vsize / b != fival->height)
+			if (bd->modes[i].hsize / b != fival->width ||
+			    bd->modes[i].vsize / b != fival->height)
 				continue;
 			if (k++ != fival->index)
 				continue;
@@ -6431,9 +6814,10 @@ static int cam_vidioc_g_parm(struct file *file, void *priv,
 	/*
 	 * cam_mode_fps is fps_x100 and stays 0 if the load-time geometry
 	 * matched no table entry (that happens: "matches no table in
-	 * imx582_modes.h"), so never hand out a 1/0 interval.
+	 * imx582_modes.h"), so never hand out a 1/0 interval.  A node that is
+	 * not the one the engine runs reports the rate bring-up gave it.
 	 */
-	fps = cam_mode_fps / 100;
+	fps = cam_node_fps_x100(cam_board_of(file)) / 100;
 
 	p->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	p->parm.capture.timeperframe.numerator = 1;
@@ -6446,36 +6830,59 @@ static int cam_vidioc_g_parm(struct file *file, void *priv,
 static int cam_vidioc_s_parm(struct file *file, void *priv,
 			     struct v4l2_streamparm *p)
 {
-	struct cam_v4l2_ctx *c = video_drvdata(file);
+	const struct cam_board *b = cam_board_of(file);
+	struct v4l2_pix_format *node = cam_node_pix(file);
+	unsigned int w = out_width, h = out_height;
 	unsigned int num, den, want;
 	int idx, ret = 0;
 
 	if (p->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
-	if (vb2_is_busy(&c->queue))
+	if (cam_any_busy())
 		return -EBUSY;
+
+	/* an auxiliary node: its own configured frame is what s_parm acts on */
+	if (node) {
+		w = node->width;
+		h = node->height;
+	} else if (cam_nodes > 1 && cam_engine_out_w) {
+		/*
+		 * Node 0's frame, not whatever board owns the engine globals at
+		 * the moment (an auxiliary camera may have selected its own).
+		 */
+		w = cam_engine_out_w;
+		h = cam_engine_out_h;
+	}
 
 	num = p->parm.capture.timeperframe.numerator;
 	den = p->parm.capture.timeperframe.denominator;
 	want = (num && den) ? (unsigned int)div_u64((u64)den * 100, num) : 0;
-	idx = want ? cam_mode_match(out_width, out_height, cam_bin, want) : -1;
+	idx = want ? cam_mode_match_on(b, w, h, cam_bin, want) : -1;
 	if (idx < 0)
 		return cam_vidioc_g_parm(file, priv, p);	/* nothing closer */
 
 	mutex_lock(&cam_lock);
-	if (idx != cam_mode_idx)
+	cam_board_select(b);
+	if (b == &cam_boards[0]) {
+		if (idx != cam_engine_mode_idx)
+			ret = cam_mode_program(idx);
+	} else if (idx != cam_mode_idx) {
 		ret = cam_mode_program(idx);
+	}
 	if (!ret) {
-		cam_mode_geometry(&cam_imx582_modes[idx], cam_bin);
+		cam_mode_geometry(&b->modes[idx], cam_bin);
 		cam_ctrl_update_exp_max();
+		if (b == &cam_boards[0])
+			cam_engine_remember();
 	}
 	mutex_unlock(&cam_lock);
 	if (ret)
 		return ret;
 
+	if (node)
+		cam_fill_pix(node);
 	pr_info("v4l2: s_parm %u/%u -> %s, %u.%02u fps\n", num, den,
-		cam_imx582_modes[idx].name, cam_mode_fps / 100,
-		cam_mode_fps % 100);
+		b->modes[idx].name, cam_mode_fps / 100, cam_mode_fps % 100);
 
 	return cam_vidioc_g_parm(file, priv, p);
 }
@@ -6674,6 +7081,7 @@ static int cam_ctrl_init(struct cam_v4l2_ctx *c)
 static int cam_v4l2_register(void)
 {
 	struct cam_v4l2_ctx *c;
+	unsigned int i;
 	int ret;
 
 	c = kzalloc(sizeof(*c), GFP_KERNEL);
@@ -6745,8 +7153,77 @@ static int cam_v4l2_register(void)
 	pr_info("v4l2: registered /dev/video%d, %ux%u YUYV, %u bytes/frame\n",
 		c->vdev.num, out_width, out_height, out_width * out_height * 2);
 
+	/*
+	 * The auxiliary cameras, when asked for.  Each gets its own node and
+	 * its own vb2 queue, but the engine behind all of them is this same
+	 * context: the CAMSV route, the capture buffer and the converter are
+	 * shared, so only one of them can stream at a time.  The default frame
+	 * is the one their userspace bring-up configured, split by the current
+	 * binning factor.
+	 */
+	for (i = 1; i < cam_nodes; i++) {
+		struct cam_aux_node *a = &cam_aux[cam_aux_count];
+		const struct cam_board *b = &cam_boards[i];
+		unsigned int bin = v4l2_bin == 1 ? 1 : 2;
+
+		a->board = b;
+		a->queue.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		a->queue.io_modes = VB2_MMAP | VB2_DMABUF | VB2_READ;
+		a->queue.drv_priv = c;
+		a->queue.buf_struct_size = sizeof(struct cam_v4l2_buf);
+		a->queue.ops = &cam_vb2_ops;
+		a->queue.mem_ops = &vb2_vmalloc_memops;
+		a->queue.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+		a->queue.lock = &c->lock;
+		a->queue.min_queued_buffers = 1;
+		ret = vb2_queue_init(&a->queue);
+		if (ret) {
+			pr_err("v4l2: %s: vb2_queue_init failed (%d)\n",
+			       b->name, ret);
+			goto err_aux;
+		}
+
+		a->pix.width = b->hsize / bin;
+		a->pix.height = b->vsize / bin;
+		a->pix.pixelformat = V4L2_PIX_FMT_YUYV;
+		a->pix.field = V4L2_FIELD_NONE;
+		a->pix.bytesperline = a->pix.width * 2;
+		a->pix.sizeimage = a->pix.width * a->pix.height * 2;
+		a->pix.colorspace = V4L2_COLORSPACE_SRGB;
+		a->pix.ycbcr_enc = V4L2_YCBCR_ENC_601;
+		a->pix.quantization = V4L2_QUANTIZATION_FULL_RANGE;
+		a->pix.xfer_func = V4L2_XFER_FUNC_SRGB;
+
+		strscpy(a->vdev.name, b->name, sizeof(a->vdev.name));
+		a->vdev.v4l2_dev = &c->v4l2_dev;
+		a->vdev.fops = &cam_v4l2_fops;
+		a->vdev.ioctl_ops = &cam_v4l2_ioctl_ops;
+		a->vdev.queue = &a->queue;
+		a->vdev.release = cam_v4l2_vdev_release;
+		a->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE |
+				      V4L2_CAP_STREAMING | V4L2_CAP_READWRITE;
+		video_set_drvdata(&a->vdev, c);
+
+		ret = video_register_device(&a->vdev, VFL_TYPE_VIDEO, -1);
+		if (ret) {
+			pr_err("v4l2: %s: video_register_device failed (%d)\n",
+			       b->name, ret);
+			vb2_queue_release(&a->queue);
+			goto err_aux;
+		}
+		cam_aux_count++;
+		pr_info("v4l2: registered /dev/video%d, %s %ux%u YUYV (node %u)\n",
+			a->vdev.num, b->name, a->pix.width, a->pix.height, i);
+	}
+
 	return 0;
 
+err_aux:
+	while (cam_aux_count) {
+		cam_aux_count--;
+		video_unregister_device(&cam_aux[cam_aux_count].vdev);
+		vb2_queue_release(&cam_aux[cam_aux_count].queue);
+	}
 err_v4l2:
 	v4l2_ctrl_handler_free(&c->hdl);
 	v4l2_device_unregister(&c->v4l2_dev);
@@ -6765,6 +7242,12 @@ static void cam_v4l2_unregister(void)
 		return;
 
 	cam_v4l2 = NULL;
+	/* the auxiliary nodes share this v4l2_device, so they go first */
+	while (cam_aux_count) {
+		cam_aux_count--;
+		video_unregister_device(&cam_aux[cam_aux_count].vdev);
+		vb2_queue_release(&cam_aux[cam_aux_count].queue);
+	}
 	/*
 	 * streamoff normally tears the pool down; do it again defensively so an
 	 * unloaded module can never leave conversion kthreads behind.
@@ -6932,6 +7415,12 @@ static int __init cam_cap_init(void)
 		pr_info("output: %ux%u YUYV, bin %u, %u bytes/frame\n",
 			out_width, out_height, cam_bin,
 			out_width * out_height * 2);
+		/*
+		 * Node 0 streams on the geometry the load parameters describe
+		 * until an application changes it, so that is what the engine
+		 * has to be able to restore.
+		 */
+		cam_engine_remember();
 	}
 
 	/* --- 1. physically contiguous frame buffer --- */
@@ -7276,6 +7765,24 @@ static int __init cam_cap_init(void)
 		cam_sensor.dgain = cam_clamp_int((int)dgain_def, CAMCAP_DGAIN_MIN,
 						 (int)dgain_max);
 		WRITE_ONCE(cam_lut_dirty, true);
+
+		/*
+		 * The main camera is the board the load-time geometry belongs
+		 * to; the auxiliary boards are described statically.  Their
+		 * nodes are only registered when cam_nodes asks for them, so
+		 * the default is the single /dev/video0 this driver has always
+		 * exposed.
+		 */
+		cam_boards[0].route_intf = route_intf;
+		cam_boards[0].hsize = cam_src_w;
+		cam_boards[0].vsize = cam_src_h;
+		cam_active = &cam_boards[0];
+		cam_modes = cam_imx582_modes;
+		cam_nmodes = CAMCAP_IMX582_NMODES;
+		if (!cam_nodes)
+			cam_nodes = 1;
+		if (cam_nodes > CAMCAP_MAX_CAM)
+			cam_nodes = CAMCAP_MAX_CAM;
 
 		ret = cam_v4l2_register();
 		if (ret) {
