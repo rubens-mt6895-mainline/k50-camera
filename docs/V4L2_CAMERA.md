@@ -1920,3 +1920,40 @@ if (frame_bytes < need) { pr_info("v4l2_enable: growing frame_bytes %lu -> %lu\n
   `--list-framesizes` 六条齐全（4000×3000 / 2000×1500 / 4000×2256 / 2000×1128 / 1920×1080 / 960×540）、
   80 帧 `timing 33.12 fps`、`dist clean=78 late=1 slip=1`、`stats r=254 g=254 b=254 dark=48%`、
   crashes 0、load 0.66 ⇒ **默认路径零回归**。
+
+## 24. 2026-10-09 深夜 XVI：**对外部代码 review 的逐条核实与处置**（含一条自我更正）
+
+外部 reviewer 对 `src/cam_cap.c` 提了 12 条。下面每条都先在代码里核实，再决定改不改；
+"对方说的"和"代码实际情况"不一致的地方如实标出。
+
+| # | reviewer 的判断 | 核实结果 | 处置 |
+|---|---|---|---|
+| 1 | `cam_mode_program()` 的 `ret` 被 init 表覆盖 | **真**：原 `src/cam_cap.c:6077-6085` 写 `0x0100=0` 之后若 `mode_init_replay` 就无条件 `ret = cam_mode_write_table(init)`，关流失败会被 init 的成功抹掉 | **已改**：`if (!ret && mode_init_replay)`，`msleep(20)` 移出条件（间隙属于时序，不属于结果） |
+| 2 | `cam_cap_arm_addr()` 从不清 `INT_STATUS`，上一帧的 `IMGO_DONE_ST` 会让 arm 立即"完成" | **真**（全文件没有一处 `cam_wr(CAMSV_INT_STATUS`） | **已改**：`cam_cap_vf_off()` 之后写回读到的值（`cam_wr(CAMSV_INT_STATUS, cam_rd(CAMSV_INT_STATUS))`）。W1C 寄存器就此清掉，读清型寄存器上是 no-op；此刻 `VFDATA_EN=0`，两次访问之间不可能新锁存完成位 ⇒ 不会吞帧 |
+| 3 | `cam_vidioc_g_parm()` 的 denominator 可能是 0 | **真**：`cam_mode_fps = cam_mode_fps / 100` 在装载几何匹配不到表时保持 0（启动日志里出现过 `mode: 4000x3000 matches no table in imx582_modes.h`） | **已改**：`fps = cam_mode_fps / 100; denominator = fps ? fps : 30;` |
+| 4 | `cam_luma8` 是死代码 | **假**：`grep cam_luma8 src/cam_cap.c` 0 匹配（该符号早已删除） | 无需改 |
+| 5 | `CAMCAP_AF_FLAT_FRAMES` 定义了没人用 | **真**（原 `src/cam_cap.c:3271`，全文件只有定义那一处） | **已删**：flat 锁存在度量恢复时本就自动解除，不需要定时重试 |
+| 6 | `conv_threads` 没按在线 CPU 数 clamp | **真**：`cam_conv_pool_start()` 只 clamp 到 `CAMCAP_MAX_CONV=8`，`num_online_cpus()` 只用于打印 | **已改**：`want = min(want, num_online_cpus())` |
+| 7 | `cam_gcd(fps,100)` 被调用两次 | **真**（原 `src/cam_cap.c:6367` `g = cam_gcd(fps, 100) ? cam_gcd(fps, 100) : 1;`） | **已改**：`if (!fps) continue;` + 单次 `cam_gcd()` |
+| 8a | `cam_lut_dirty` 缺同步原语 | **真**（`true`/`false` 都由 `WRITE_ONCE` 写、由 `READ_ONCE` 读） | **已改**：7 处写 `WRITE_ONCE`、2 处读 `READ_ONCE` |
+| 8b | `cam_sensor` 缺同步原语 | **真，但不改** | 见下面的说明 |
+| 9 | `__v4l2_ctrl_modify_range()` 没持 ctrl handler 锁 | **真**：调用点（`cam_mode_select`/`s_fmt`/`s_parm`）都在 `cam_lock`（vb2 queue lock）里，而 `__` 变体要求持 handler 锁 | **已改**：改用头文件里的 `static inline v4l2_ctrl_modify_range()`（它自己 `v4l2_ctrl_lock()`）。**踩到一颗雷**：本内核 `struct v4l2_ctrl_handler.lock` 是 `struct mutex *`（不是内嵌 mutex），第一版写成 `mutex_lock(&cam_v4l2->hdl.lock)` 直接编译失败（`passing 'struct mutex **'`） |
+| 10 | `cam_band_sync()` 用全局 `cam_src_stride`/`cam_src_h` | **真**（`src/cam_cap.c:5131-5151`） | **未改**（可选洁癖）：流式期间不可能换模式（`vb2_is_busy` 挡住 `s_fmt`），几何在整条 pipeline 生命周期里恒定；要做的话是把 stride/rows 快照进 ctx 的 job 结构（现在只有 `job_phys`/`job_size`） |
+| 11 | `sensor_bin`（片内 2×2）与驱动的 `cam_bin`（软件 2×2）同名不同物 | **真** | 未改：属命名，改 `src/imx582_modes.h` 要重新生成表，收益低于风险 |
+| 12 | `nregs`、`cam_mode_reg.val` 只用到低 8 位等 | **真** | 未改：生成器加 `static_assert` 是下阶段的清理项 |
+
+**`cam_sensor` 为什么按原样保留（8b）**：`struct cam_sensor_state` 是三个 `u32`（`src/cam_cap.c:1033-1037`），`READ_ONCE()` 对 12 字节的非标量结构体不适用；
+arm64 上对齐字存储是单拷贝原子的，读者只会看到上一帧或本帧的完整值，不会看到混合值；
+而写者里包含 V4L2 控制回调（它们已经在 ctrl handler 锁里、且是在 vb2 queue lock 之下进入的），
+在那个位置再插第三把锁只会新增一条顺序规则、不会带来可观测的正确性收益；一帧的陈旧值由下一趟 governor 改写。
+决定不改成"快照 + spinlock"，因为要动的正是已经上机验证过的最热的路径。
+
+**真机复核（新构建 928 232 B，md5 `61bf291f7a76c5152138dd684a507981`，`scripts/zz_fix7.sh`）**：
+默认栈重新加载后 100 帧 `timing period=29882us arm=30257us conv=22577us fps=33.46 frames=100`、
+`avg 32.03`、`dist clean=95 late=1 slip=4 lost=0 nom=30066us`、`stats r=261 g=263 b=258`、
+`af state=hold pos=640 metric=516 ref=509 scans=1 flat=0`、**`timed out` 计数 0** ⇒ 新的 `INT_STATUS` 写回没有吞掉任何完成事件。
+`dmesg` 里能匹配 "Call trace" 的 8 行全部来自 **`cam_genpd` 自己**（`camgenpd_init+0xb4` → `dev_pm_domain_attach` → `genpd_add_device` → `dev_pm_domain_set+0x64`，t≈22.9 s 开机阶段），与 `cam_cap` 无关。
+
+**构建陷阱（本次浪费了两次构建）**：`scripts/z_build_camcap.sh` 的默认 `K=${HOME}/work/cac2c-bisect`（**没有 Module.symvers**、vermagic `7.2.0-gcac2c2fc0d2c`）、默认 `OUT=out/camcap`；
+必须显式 `K=${KDIR} OUT=${K50_REPO}/out/camcap_0b8dd2e SRC=${K50_REPO}/src bash scripts/z_build_camcap.sh`。
+用错树时构建"成功"但 .ko 落在别的目录、且 vermagic 对不上设备（这也是为什么早先有人以为"编辑没被编进去"）。

@@ -1793,3 +1793,17 @@ MemFree 9.41 → 9.24 GB、crashes 0；③ 相机仓 **9fa42e8** / 内核 **fbad
 - 守卫（`cam_mode_fits()`，`src/cam_cap.c:5847-5853`）仍保留：它只在 `dma_alloc_coherent()` 因 CMA 紧张
   折半回退（`src/cam_cap.c:6966-6973`）之后才会拒绝过大的模式 ⇒ 正常路径行为零变化、真机无法触发。
 - B 腿（`zz_restore.sh`）：默认几何、六条 framesizes、33.12 fps、crashes 0 ⇒ 零回归。
+
+## 27. ★★ 2026-10-09 深夜 XVI：外部代码 review 的逐条核实（改 8 条、否 1 条、说明 1 条）
+
+reviewer 提 12 条，逐条在代码里核实后：**真·必修 3 条全部改掉**（`cam_mode_program()` 的 `ret` 覆盖、`cam_cap_arm_addr()` 不清 `INT_STATUS`、`cam_vidioc_g_parm()` 的分母可能为 0），
+**真·应修 4 条改掉**（删掉没人用的 `CAMCAP_AF_FLAT_FRAMES`、`conv_threads` clamp 到在线 CPU、`cam_gcd()` 只调一次、`cam_lut_dirty` 全部 `WRITE_ONCE`/`READ_ONCE`），
+**1 条举手投降**（`__v4l2_ctrl_modify_range()` 的锁 → 改用 `v4l2_ctrl_modify_range()`；雷点是本内核 `v4l2_ctrl_handler.lock` 是**指针**，`&` 会编译失败），
+**1 条判假**（`cam_luma8` 早已删除，grep 0 匹配），
+**1 条不改但写清理由**（`cam_sensor` 三个 u32 的对齐字存储在 arm64 上单拷贝原子，读者不会看到混合值；写者含 ctrl 回调，再插锁只增顺序规则）。
+可选洁癖的 3 条（`cam_band_sync` 的全局 stride、`sensor_bin` 命名、`nregs` 编译期校验）留作下阶段。
+
+**真机复核**（928 232 B，md5 `61bf291f…`）：`arm=30257us` 仍是整帧周期（没有出现"arm 立即完成"）、100 帧 33.46 fps、`dist clean=95 late=1 slip=4 lost=0`、arm 超时 **0** 次 ⇒ `INT_STATUS` 写回安全。
+`dmesg` 里 8 行 "Call trace" 全部来自开机阶段的 **`cam_genpd`**（`dev_pm_domain_set+0x64`），不是相机驱动。
+
+**顺手记下的构建坑**：`z_build_camcap.sh` 默认编到 `cac2c-bisect`（无 Module.symvers、vermagic 不匹配），必须显式给 `K=`/`OUT=`，否则会得到"看着成功、其实编错树"的 .ko。
