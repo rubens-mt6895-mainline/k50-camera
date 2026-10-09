@@ -732,3 +732,45 @@ Sanity fallbacks if step 6 fails:
    the CCU's 5..21 CAMSV window with its matching instance (U4): e.g. cam_mux 5 → `camsv3@1a112000`
    (`PCSR` = `0x1a0104a0`) or cam_mux 8 → `camsv6@1a115000` (`PCSR` = `0x1a010500`); only rows 11-16
    change, row 12's `SRC_SEL` stays 1.
+
+---
+
+## 附录 A：D-PHY 接收机初始化序列（并入自已删除的 `SENINF_CONFIG.md`）
+
+`SENINF_CONFIG.md` 里被实测推翻的三条**不要再用**：`step 8` 的 CAM_MUX 布局（写成 `0x400` 区每 4 bit
+一个源选择： 实际是 `PCSR 0x400 + 0x20 * cam_mux`，见本文件正文）、`step 6` 的 "RAW10 ⇒ 2 px/周期"
+（实测 `route_pix_mode = 2` 对应 12-bit 打包）、以及探针地址 `CSI2_PACKET_CNT = 口基 + 0x8D8`
+（正确是 per-CSI2 + `0xDC`，口 2 = `0x1a014adc`）。下面这几段是当时**正确**的部分。
+
+### A.1 基址风格：2_0 风格基址 + 3_0 语义
+
+端口 2 的 ANA/D-PHY 块在 `0x11c88000` / `0x11c89000` / `0x11c8a000` 一带（即"2_0 风格基址"），
+但语义按 `phy_3_0`：时钟 lane settle、`SPARE0 = 0xf1`、trail 计算、RESYNC full-write、
+`CDR_CK_DELAY = 4`、没有 RESERVE/RST_MODE。**3_0 头文件里的基址表属于别的芯片，不要用**
+（它把 port2 写成 `0x4000/5000/6000`，实测那块全静默）。
+
+### A.2 配置顺序（从 `hw_phy_2_0.c` 提取）
+
+1. **模拟 BG 上电**：`ANA_8` 的 6 个 `EQ_OS_CAL_EN = 0`；`ANA_0` 的 `BG_LPF_EN = 0`、
+   `BG_CORE_EN = 0` → `udelay(200)` → `BG_CORE_EN = 1` → `udelay(30)` → `BG_LPF_EN = 1` →
+   `udelay(1)` → 6 个 `EQ_OS_CAL_EN = 1` → `udelay(1)`。
+2. **EQ tune**：`ANA18/1C/20` 的 `EQ_IS = 1`、`EQ_BW = 1`（每 lane）。
+3. **D-PHY init**：每 lane `HS_PARAMETER`：`settle_delay_dt`（默认 0x23 左右）、`HS_PREPARE = 2`、
+   **`HS_TRAIL = 0x1a`（26）**： 计算链 `dphy_trail = 68 / ui_224 = 163 / SENINF_CK = 273 MHz`
+   ⇒ `ceil((163-68) × 273e6 / 1e9) = 26`；`data_rate < 800M` 时 `HS_TRAIL_EN = 1`。
+   （笔记里出现过的 `0x34`、`0x20` 都与实测 26 冲突，以 26 为准。）
+4. **CSI2 数字**：`DBG_CTRL.RG_CSI2_DBG_PACKET_CNT_EN = 1`（后面测包计数就靠它）；
+   `RESYNC_MERGE_CTRL.CYCLE_CNT_OPT = 1`；4 lane 时 `CSI2_EN = 0xF`；
+   `CSI2_OPT.CPHY_SEL = 0`；`HDR_MODE_0` 的 `HEADER_MODE = 0`、`HEADER_LEN = 0`。
+5. **SENINF CTRL**：`SENINF_CSI2_CTRL.RG_SENINF_CSI2_EN = 1`，随后 `SENINF_EN = 1`。
+6. **mux**：`CTRL_1` 写 `MUX_SRC_SEL` + `PIX_MODE_SEL`；`MUX_OPT` 写 HSYNC/VSYNC 极性；
+   `CTRL_0` 先 `|0x6`（`SW_RST` + `IRQ_RST`）再 `&~0x6`；最后 `MUX_EN`（`CTRL_0` b0）= 1。
+7. **TOP mux**：`TOP_MUX_CTRL_0..3` 里每 8 bit 一个 SENINF mux 的源选择。
+8. **CAM_MUX**：见本文件正文（`PCSR` 页，`SRC_SEL = 8` 表示 `MIPI_SENSOR + group`）。
+9. **CAMSV TG + DMA**：见 `CAMERA_NOTES.md §8` 与 §附录 A。
+
+### A.3 帧缓冲协议（`cam_view.c`）
+
+`/tmp/frame.rgb` = 头 `"K50F"` + u32 宽 + u32 高 + RGB888 数据；`cam_view.c` 最近邻放大写到
+`/dev/fb0`，每 0.5 s 重刷。抓帧侧负责 12-bit 解包 + nearest 邻去马赛克（RGGB）后写这个文件
+（`src/cam_view.c` + `src/cam_view.py` 里的 python 版）。

@@ -171,7 +171,7 @@
 ### 外场执行路径（设备在外场期间）
 设备在外场时的执行路径（${K50_REPO}
 emote\ 三个脚本）：
-1. **step1-phone-setup.sh**（手机触摸屏手打 3 行）：root 临时密码 k50out + 开 SSH 密码登录 + 打印 IP。
+1. **step1-phone-setup.sh**（手机触摸屏手打 3 行）：设一个**一次性 root 口令**（过后即废，不记在此）+ 开 SSH 密码登录 + 打印 IP。
 2. 外场电脑 `ssh root@<手机IP>`（同网络/热点）→ 整段粘贴 **step2-fingerprint-relay.sh**：dd 补丁 goodixfp.ta 的两个门（文件偏移 235916/235932 写 NOP 1f2003d5，先校验原始字节 e0220035/c20e0054）→ 跑 enroll 20 → 抓关键结果。**v40 补丁等价实现，无需传输二进制！**
 3. **step3-camera-relay.sh**：只读检查（电源轨保持？MCLK/RST 引脚状态？总线扫描）。相机完整上电仍缺 cam_pwr.ko 传输：若手机有外网，可走 GitHub 中转（ta_host/cam_pwr.ko 均为自有代码，无固件内容）。
 修复回滚：`cp /opt/goodixta/ta/goodixfp.ta.orig /opt/goodixta/ta/goodixfp.ta`。
@@ -1063,6 +1063,10 @@ FBC_EN b15 / VALID_NUM b23:16 / SUB_RATIO b31:24)、`0x244 FBC_IMGO_CTL2`(IMGO_R
 `setup_cfg_info` 的 HOLD/释放必须成对且不可重排；`VFDATA_EN(0x104 b0)` 是所有函数公认的"正在出流"标志。
 
 ### 8.9 还需要自己决定的量（vendor 由上层 V4L2/ISP 驱动提供）
+
+> **⚠️ 8.9 的以下条目是 2026-10-06 的推测，其中两条已被真机实测推翻**
+> 线上格式是 **12-bit 打包（1.5 B/像素）**，一行 4000 像素 = **6000 字节**、每帧 18 000 000 字节；`route_pix_mode` 取 **2**。也就是说下面关于`FMT_SEL.TG1_FMT` 的 "RAW10 ⇒ 0/1/2/4 之一" 与 `0x718 IMGO_STRIDE = RAW10 packed×2` 两条都已经作废（实测见 §12/§13 与 [V4L2_CAMERA.md](V4L2_CAMERA.md) §5）。
+> 其余条目（`DBL_DATA_BUS`、PXL/LIN start+end、`SUB_RATIO=0`）仍然成立。
 - `0x044 FMT_SEL` 的 `TG1_FMT` 码：**IMX582 RAW10 ⇒ 查 `format_sel` 的 FOURCC 表**（RAW10 通常是 MIPI RAW10 → 需确定是 0/1/2/4 中哪一个）。
 - `0x100` 的 `DBL_DATA_BUS(b5:4)`：由 `tg_config` 的 fmt 分支决定（0..3）。
 - `0x108/0x10C` 的 `PXL/LIN start+end`：按 sensor 的 crop（4000×3000 全幅 ⇒ start=0, end=width/height）。
@@ -1783,7 +1787,7 @@ MemFree 9.41 → 9.24 GB、crashes 0；③ 相机仓 **9fa42e8** / 内核 **fbad
 - `hs_video` 的 240 fps **打不满**：`arm=4225 µs`（≈ 标称 4165 µs）说明传感器在跑 240，但整帧转换 4.0 ms + 取帧开销 ~1.3 ms ⇒ 实测 182 fps。
 - `slip`/`lost` 逐次运行都在变（custom3 此前 600 帧全清、这次 3 个 lost）⇒ 只看 `timing`/`avg` 的 period。
 
-### 27. 缓冲 fit 守卫（以及一次自我更正）
+### 26.1 缓冲 fit 守卫（以及一次自我更正）
 
 - 怀疑：`cam_mode_match()` 只看尺寸不看缓冲，而 `cam_cap_init()` 的 v4l2 块按 `exp_hsize/exp_vsize` 定缓冲 ⇒
   用 4000×2256 装载再 `S_FMT` 到 4000×3000 会越界。
@@ -1807,3 +1811,74 @@ reviewer 提 12 条，逐条在代码里核实后：**真·必修 3 条全部改
 `dmesg` 里 8 行 "Call trace" 全部来自开机阶段的 **`cam_genpd`**（`dev_pm_domain_set+0x64`），不是相机驱动。
 
 **顺手记下的构建坑**：`z_build_camcap.sh` 默认编到 `cac2c-bisect`（无 Module.symvers、vermagic 不匹配），必须显式给 `K=`/`OUT=`，否则会得到"看着成功、其实编错树"的 .ko。
+
+## 28. 2026-10-09 深夜：四摄各占一个 video 节点 + 一次整机死锁
+
+- `cam_nodes`（默认 1，1..4）：把主摄/前摄/超广角/微距各注册成一个 `/dev/videoN`，
+  共用同一个采集引擎（四颗经 CAM_MUX 3 汇到同一个 CAMSV，所以同一时刻只能一路出流）。
+  `cam_nodes=1` 时新代码全不执行，单节点行为逐字节不变。
+- 实测：4 个节点、GStreamer 枚举 `device count: 4`；前摄/超广角/微距分别
+  29.94 / 30.13 / 30.08 fps 原生尺寸出帧，主摄 bin2 `timing 33.41 fps`。
+- 关键顺序：辅助相机的 FAN53870 rails 必须在驱动加载**之后**写（主摄那套启动脚本
+  会写同一个 PMIC），否则 `csirx PKT=0` / CAMSV 全超时。
+- ★整机死锁：验证"微距出流后节点 0 回到主摄"时，新加的 `cam_engine_restore()`
+  把 `route_intf` 改回 4 ⇒ `arm` 里隐式重跑 `cam_route()` ⇒ 设备硬死（ssh 超时、
+  ping 全丢、gadget serial 零回声），只能断电重启。
+- 处置：驱动**永不隐式重路由**： 节点 0 发现引擎停在别的板子上时
+  `pr_err` + `return -EBUSY`，由用户态重跑 bring-up 后用
+  `echo mode <name> > /proc/camcap` 显式选回主摄；`cam_engine_restore()` 只恢复几何。
+
+---
+
+## 附录 A：CAMSV 反汇编稿里仍然成立的事实
+
+原 `docs/camsv_report.md`、`docs/camsv_register_sequence_report.md`、`docs/camsv_frame_params.md`
+三份研究稿已从仓库删除（它们的前提"RAW10 / 5000 字节每行"已被实测推翻，见 §12/§13），
+这里只保留**未被后续实测覆盖**的部分。
+
+### A.1 `format_sel` / `pak_sel`：FOURCC → `FMT_SEL.TG1_FMT` 码
+
+两个函数都是**纯 C、无 MMIO**，把 FOURCC dword 过一条 `cmp w8,#imm; b.gt/b.eq` 比较链：
+
+| FOURCC (w0) | 码 |
+| --- | --- |
+| `0x4141_xxxx`（GR/BG 家族，10/12-bit） | **1** |
+| `0x4142_xxxx`（BA 家族） | **2** |
+| `0x4342_xxxx`（RG 家族） | **2** |
+| `0x4141_3138` / `0x4142_3138`（MTISP `8AB1`） | **4** |
+| 其它 | **0** |
+
+码值直接落到 3-bit 的 `TG1_FMT`（`0x044`）。同一条调用链还会把第二个 FOURCC 开关写进 ctx
+记录（`str w24,[x19,#0x10]`）：`0x380` / `0x381` / `0x382` / `0x38F`，默认 `0x300`。
+
+### A.2 `top_config` 的 `0x600`
+
+`mtk_cam_sv_top_config` 写 `0x40 / 0x44 / 0x48 / 0x74 / 0x78 / 0x7C / 0x88 / 0x1C0 / 0x600`；
+其中 `0x600 = 0x04000000`（`DCM_MODE`，b26）。
+
+### A.3 `dmao_config` 不写 `0x71C`（否证）
+
+`mtk_cam_sv_dmao_config` 的地址清单是 `0x710 / 0x714 / 0x718 / 0x74C = 0 / 0x720..0x730`
+（CON0..CON4 突发阈值）；反汇编里**没有**观察到把 stride 写进 `0x71C` 的 `str`。
+
+### A.4 十三个 enable/disable/trigger 函数的净结果
+
+逐偏移 `op/mask` 表已在 §8.7。四条容易踩的结论：
+
+- `top_disable` 对 `0x40` 是**整字写 0**，并且还冗余地写 `0x240 = 0`；
+- `QBN_DP_CK_EN` 打开之后**从不被清**；
+- `UFEO_DP_CK_EN` 在这十三个函数里**从未被碰过**；
+- `TG_EN` / `PAK_EN` **不在这十三个函数里**（所以最小 8 步启动序列不含它们）。
+- 调试快照用的只读影子指针 `dev->base = [x0,#0x18]`、`[x0,#0x20]` 只出现在两个 toggle 函数中。
+
+### A.5 `INT_EN`（`0x048`）= `0x00011070`
+
+置位的是 b4 `TG_ERR`、b5 `TG_GBERR`、b6 `TG_SOF`、b12 `SW_PASS1_DON`、b16 `DMA_ERR`、
+b20 `IMGO_DONE`。**b0（`VS_INT_EN`）与 b31（`INT_WCLR_EN`）未置** ⇒ 没有"读自动清"语义，
+`INT_STATUS` 必须由驱动写回清零（这条在 2026-10-09 的外部 review 里被补进驱动，见 §27/§24）。
+
+### A.6 反汇编没有回答的问题（当时标注，未验证）
+
+- 有没有 16-bit 容器（`2*width`）分支：**没有找到**（这也算"12-bit / 1.5 B 每像素"的旁证之一）；
+- `pak_sel` 的低字节是 packing class，不是 Bayer 顺序；
+- `desc[6]`、四项对齐表、stride helper、`[dev+0x10]` 的身份、TG END 是否含端点： 五项至今未知。

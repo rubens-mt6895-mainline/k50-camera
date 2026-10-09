@@ -1860,9 +1860,9 @@ dist : clean(<1.15x)=78 late(1.15-1.6x)=0 slip(1.6-2.2x)=2 lost(>=2.2x)=0  nom=3
 - `slip`/`lost` 的个数**每次运行都在变**（`custom3` 同一配置此前 600 帧全清、这次 3 个 lost）⇒ 它们是稀疏 hiccup 的计数，别拿单次数字下结论；`timing`/`avg` 的 period 更稳。
 - `dist` 的桶现在跟着模式走，所以同一份"1.6×"在不同模式下对应不同的绝对时间：preview 是 48 ms、custom3 是 26.6 ms、hs_video 是 6.7 ms： 高速模式对抖动的宽容度自然更小。
 
-### 24. 缓冲"装不下"时的守卫（以及一次自我更正）
+### 23.4 缓冲"装不下"时的守卫（以及一次自我更正）
 
-#### 24.1 怀疑的由来
+#### 23.4.1 怀疑的由来
 
 读 `VIDIOC_S_FMT` 的路径时注意到两件事：`cam_mode_geometry()`（`src/cam_cap.c:5878-5897`）会**无条件**改掉
 `out_width`/`out_height`/`exp_max`/`cam_mode_fps`，而 `cam_mode_match()`（`src/cam_cap.c:5861-5897`）选模式时
@@ -1874,7 +1874,7 @@ dist : clean(<1.15x)=78 late(1.15-1.6x)=0 slip(1.6-2.2x)=2 lost(>=2.2x)=0  nom=3
 在 `cam_mode_match()`（`src/cam_cap.c:5877-5882`，附 `does not fit the %lu byte buffer` 日志）、
 `cam_mode_program()`（`src/cam_cap.c:6048` 起，返回 `-ENOSPC`）和两个 enum 循环里各拦一道。
 
-#### 24.2 真机测试：守卫没拦住： 因为**本来就不需要拦**
+#### 23.4.2 真机测试：守卫没拦住： 因为**本来就不需要拦**
 
 `out/re/zz_fit.sh` 的 A 腿用 normal_video 几何装载：
 
@@ -1904,14 +1904,14 @@ if (frame_bytes < need) { pr_info("v4l2_enable: growing frame_bytes %lu -> %lu\n
 **我最初怀疑的那个 latent overrun 不存在**（这也解释了为什么 `out/re/zz_matrix.sh` 能在同一个栈上
 自由切 6 个尺寸而不出问题）。
 
-#### 24.3 守卫为什么还是留下了
+#### 23.4.3 守卫为什么还是留下了
 
 因为 `dma_alloc_coherent()` 有 CMA 不够时的**折半回退**（`src/cam_cap.c:6966-6973`）：
 申请失败就 `want >>= 1` 一路退到 `CAMCAP_MIN_BUF`，此时 `cam_buf_size` 会**小于** `maxneed`。
 那种情况下守卫让过大的模式得到 `-ENOSPC`（且不出现在 `ENUM_FRAMESIZES` 里），而不是写出界。
 正常路径下 `need <= avail` 恒成立 ⇒ 守卫不改变任何既有行为。
 
-#### 24.4 诚实清单
+#### 23.4.4 诚实清单
 
 - 守卫在**正常路径下永不触发**，真机上**也没法主动触发**：显式 `frame_bytes=13631488` 会被 `maxneed`
   重新抬回 18 874 368，要触发只能把 CMA 池弄小（侵入性太大，不做）。⇒ 这条结论是**逻辑审查**，没有运行证据。
@@ -1957,3 +1957,103 @@ arm64 上对齐字存储是单拷贝原子的，读者只会看到上一帧或�
 **构建陷阱（本次浪费了两次构建）**：`scripts/z_build_camcap.sh` 的默认 `K=${HOME}/work/cac2c-bisect`（**没有 Module.symvers**、vermagic `7.2.0-gcac2c2fc0d2c`）、默认 `OUT=out/camcap`；
 必须显式 `K=${KDIR} OUT=${K50_REPO}/out/camcap_0b8dd2e SRC=${K50_REPO}/src bash scripts/z_build_camcap.sh`。
 用错树时构建"成功"但 .ko 落在别的目录、且 vermagic 对不上设备（这也是为什么早先有人以为"编辑没被编进去"）。
+
+## 25. 2026-10-09 深夜 XVII：**四颗相机各占一个 video 节点**（Cheese 里出现四个相机）+ 一次把设备卡死的隐式重路由
+
+### 25.1 目标
+用户要求"另外四个镜头接进 Cheese"。此前驱动只有一个 `/dev/video0`，切换相机必须
+`rmmod` + 用另一套模块参数重新 `insmod`，所以 Cheese 里永远只有一台相机。
+
+### 25.2 实现（`cam_nodes`，默认 1）
+- 新增模块参数 `cam_nodes`（1..4，默认 **1**）。`cam_nodes=1` 时全部新代码都不执行，
+  单节点行为与旧版逐字节一致。
+- `struct cam_board` 描述一台相机：名字、`querycap` 的 card 字符串、SENINF intf、
+  原生尺寸、帧率、曝光上限，以及三个布尔量 `sensor_drv`/`ae`/`awb`/`af`。
+  `cam_boards[0]` = 主摄 IMX582（全 true，挂 `cam_imx582_modes`）；
+  `[1]` 前摄 IMX596 intf 0、`[2]` 超广角 S5K4H7 intf 2、`[3]` 微距 GC02M1 intf 6
+  （三者 `sensor_drv=false`，各自只有一张"原生尺寸"的 `cam_sensor_mode`，
+  `regs=NULL`）。
+- 每个辅助相机一个 `struct cam_aux_node { video_device; vb2_queue; v4l2_pix_format; board; }`：
+  自带 queue（`vb2_vmalloc_memops`，只在真的用它时才分配缓冲，不占 CMA）与 pix；
+  `queue.drv_priv` 指向**共享的引擎 ctx**，所以 vb2 的 buf_prepare/start/stop 回调
+  一行都不用改；`v4l2_dev`、`fops`、`ioctl_ops`、`lock` 与节点 0 共用。
+- ioctl 按节点分流：`cam_board_of(file)` 用 `video_devdata()` 认出节点，
+  `querycap.card`、`g_fmt`、`try_fmt`、`s_fmt`、`enum_framesizes`、`enum_frameintervals`、
+  `g_parm`、`s_parm` 全部走该节点自己的板子与尺寸；
+  `cam_any_busy()` 让"任何一个节点在流"都算忙（四颗相机经 CAM_MUX 3 汇到同一个 CAMSV，
+  **同一时刻只能一路出流**）。
+- 辅助相机的寄存器表、电源、MCLK、reset、D-PHY 全部仍由**用户态** bring-up 完成
+  （驱动没有它们的 DT 节点与 regulator），所以这类节点只报 bring-up 配好的那一个
+  原生尺寸（外加软件 2×2 的 1/2 尺寸），并且不动它们的 AE/AWB/AF： 否则会往一颗
+  驱动并不认识的 sensor 写寄存器。
+
+### 25.3 实测
+| 项目 | 结果 |
+|---|---|
+| 节点 | `/dev/video0..3`，card 分别 `MT6895 CAMSV1 (IMX582)` / `(IMX596 front)` / `(S5K4H7 ultrawide` / `(GC02M1 macro)` |
+| 前摄 IMX596 | 2592×1952 原生，31 帧，`timing fps=29.94`，`stats n=316224 r=451 g=531 b=373` |
+| 超广角 S5K4H7 | 3264×2448 原生，31 帧，`timing fps=30.13`，`stats n=499392 r=256 g=256 b=256` |
+| 微距 GC02M1 | 1600×1200 原生，31 帧，`timing fps=30.08`，`stats n=120000 r=324 g=341 b=296` |
+| 主摄 IMX582 | 2000×1500 bin2，`timing fps=33.41`，`dist clean=58 late=1 slip=1 lost=0` |
+| GStreamer 枚举（Cheese 看到的） | **device count: 4**，四条 caps 就是各节点的尺寸 |
+| `cam_nodes=1` 重载 | 只剩 `/dev/video0`，`timing fps=33.04`，无回归 |
+
+辅助相机 bring-up 的顺序很关键：`zz_v80.sh`/`zz_cam_up.sh`（主摄那套）会写 FAN53870，
+所以**辅助相机的 rails 必须放在驱动加载之后**，否则（实测）`csirx PKT=0` 或 CAMSV
+一直超时。同时上电三颗时，`1→2→3` 顺序下超广角会失败（0 帧 + 2 次超时），
+`2→1→3` 则三颗全通： 辅助相机之间有运行期耦合，谁先推流会影响谁；
+用前重跑该端口的 `csirx_bring.py` 即可恢复。
+
+### 25.4 ★事故：隐式重路由把设备卡死（2026-10-09 22:47）
+回归脚本 `scripts/zz_nodes2.sh` 先推微距（正常，30 帧），随后推节点 0
+（不带 `s_fmt`，本意是验证"引擎几何要回到主摄"）。就在这一步：
+- ssh 报 `Timeout, server ${K50_HOST} not responding`，ping 100% 丢包（持续数分钟），
+- Windows 侧 COM9（USB gadget serial，`VID_0525&PID_A4A7`）**仍在、状态 OK**，
+  但串口零回声（`CR`/`root`/`uptime`，DTR/RTS 两种都试过）⇒ **内核级死锁**
+  （用户态死不会连内核 tty 回声一起丢），只能长按电源键断电重启。
+
+出事序列相对上一次（同样的"微距→节点 0"，但用**改之前**的模块）的唯一差别是：
+新加的 `cam_engine_restore()` 会把 `route_intf` 从 6 改回 4 ⇒ `cam_route_done = false`
+⇒ `arm` 时重跑 `cam_route()`，也就是**在另一颗相机的 bring-up 还占着接收机的时候
+隐式改写 SENINF / CAM_MUX / CSI2 路由**。这是整条路径上唯一新增的硬件写，
+因此被判定为元凶（四颗相机各有独立 D-PHY，但 CAM_MUX 3 与 SENINF 路由是共享的；
+"顺序敏感"这个现象早就提示切换相机对 ANA/PHY 状态很脆弱）。
+
+### 25.5 安全策略：驱动永不隐式重路由
+`cam_vb2_start_streaming()` 的引擎分支现在**拒绝**而不是接管：
+
+```c
+if (cam_active != &cam_boards[0]) {
+        pr_err("v4l2: node 0 refused: the engine is on %s (...)\n",
+               cam_active->name);
+        return -EBUSY;
+}
+cam_engine_restore();
+```
+
+即：如果引擎还停在辅助相机上，节点 0 直接返回 `-EBUSY` 并打日志，用户态先把那颗
+相机自己的路径恢复（重跑它的 bring-up），再用
+`echo mode <name> > /proc/camcap` 显式把主摄的模式表与路由选回来。
+`cam_engine_restore()` 只在 `cam_active` 已经是 board 0 时才会运行，此时
+`route_intf` 相等 ⇒ 不会产生任何路由/D-PHY 写，只恢复几何量。
+`cam_nodes=1`（开机脚本的默认值）根本不进这段代码 ⇒ 默认路径保持已验证的安全行为。
+
+### 25.6 怎么用
+1. 开机脚本仍按默认（`cam_nodes=1`）加载，得到已知安全的主摄单节点。
+2. 要看四个相机：`CAM_CAP_PARAMS="cam_nodes=4" sh /root/zz_cam_up.sh`，
+   四个节点立刻出现（Cheese 会列出四台相机，但只有主摄那台现在真的能出图）。
+3. 要用某颗辅助相机：`sh /root/zz_front_node.sh`（前摄）/ `zz_uw_node.sh`（超广角）/
+   `zz_macro_node.sh`（微距）： 它们会重载驱动、按正确顺序上电、回放寄存器表、
+   重跑该端口的 `csirx_bring.py`，然后推该节点。
+4. **不要**在一颗辅助相机出过流之后直接去推另一颗（或节点 0）： 会串画面；
+   换相机就重跑那颗相机自己的脚本。
+
+### 25.7 诚实清单
+- 四个节点可以在 Cheese 里同时**列出**（枚举层已达成）；但**同时出流不可能**：
+  四颗相机经 CAM_MUX 3 汇入同一个 CAMSV，硬件上只有一条路。
+- 辅助相机之间互不独立：同一颗相机被不同顺序 bring-up 时会互相影响
+  （见 25.3 末尾），目前靠"用前重跑 csirx"规避，没有根治。
+- 每节点 caps 里仍多出一条带 `interlace-mode=(string)alternate` 的重复分辨率
+  （小的那一档）；TRY_FMT/S_FMT 已经拒收非 NONE/ANY 的 field，但 GStreamer
+  的 provider 仍会把它列出来，尚未查明（只是同一台相机里多一个重复项，不是多一台相机）。
+- 交叉切换曾导致整机死锁（25.4）；安全策略是"拒绝 + 明确报错"，不是"已经修好了"。
