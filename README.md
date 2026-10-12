@@ -4,8 +4,8 @@
 采集驱动、传感器寄存器表、bring-up 工具与实测记录。
 
 内核侧对应仓库：<https://github.com/rubens-mt6895-mainline/linux>（分支 `7.2-mt6895-xiaomi-rubens`）。
-本项目的驱动没有进内核树： 它通过自己的 `/dev/videoN` 节点提供 YUYV 视频流，标准 V4L2 应用
-（Cheese、GStreamer、`v4l2-ctl`）都能直接用。
+本项目的驱动是树内模块，收在内核仓的 `drivers/media/platform/mediatek/camsv/` 下（未进 mainline
+上游）：它通过自己的 `/dev/videoN` 节点提供 YUYV 视频流，标准 V4L2 应用（Cheese、GStreamer、`v4l2-ctl`）都能直接用。
 
 ## 仓库内容
 
@@ -13,7 +13,7 @@
 | --- | --- |
 | `src/` | 驱动 `cam_cap.c`（CAMSV 采集 + V4L2/videobuf2 + AE/AWB/AF 控制律 + 四节点）；`imx582_modes.h`（模式表）；`ovl_i2c4.c`（运行时 DT overlay）；一批 bring-up 探针模块；厂商开源内核里的参考驱动 |
 | `dt/` | 设备树片段：相机 bring-up 覆盖层、厂商相机 dtsi |
-| `modes/` | IMX582 七个模式的寄存器表（文本，`0xREG 0xVAL`，可直接重放到传感器） |
+| `modes/` | IMX582 寄存器表 9 张（7 个模式 + `init` + `Image_quality`；文本 `0xREG 0xVAL`，可直接重放到传感器） |
 | `sensors/` | IMX596 / S5K4H7 / GC02M1 的初始化与尺寸表（同样格式） |
 | `docs/` | 文档，见下 |
 | `scripts/` | 只收录被文档引用的工具（构建、bring-up、验证、分析） |
@@ -45,7 +45,7 @@ GC02M1 ─ port 3 ─▶ intf 6 ─┘
   （驱动没有它们的 eeprom/regulator 节点），驱动只负责给它们开视频节点。
 - 线上格式：12-bit 打包，1.5 字节/像素（4000×3000 ⇒ 6000 字节/行、18 000 000 字节/帧）。
 
-## 当前状态（2026-10-09）
+## 当前状态（2026-10-11）
 
 - **四颗相机都能出帧**：IMX582 4000×3000（~33 fps）、IMX596 2592×1952（29.9）、S5K4H7 3264×2448（30.1）、
   GC02M1 1600×1200（30.1）。
@@ -77,8 +77,8 @@ GC02M1 ─ port 3 ─▶ intf 6 ─┘
 
 像素时钟规则（IMX586 标定表与 IMX582 实测双重验证）：`pclk = 4.8 MHz × ((0x0306<<8)|0x0307)`、
 `fps = pclk / (HTS × VTS)`。`capture` / `slim_video` / `custom1` / `custom6` 四张表在这份 rubens
-vendor 驱动里是空的。每个模式的寄存器表在 `out/modes/mode_<name>.txt`（`scripts/gen_mode_table.py` 从
-vendor 头文件导出；仓库里只有 `out/modes/`，没有 `modes/`）。
+vendor 驱动里是空的。每个模式的寄存器表由 `scripts/gen_mode_table.py` 从 vendor 头文件导出（开发工作区里
+生成到 `out/modes/`），本仓 `modes/` 下收的是一份副本。
 
 ## 快速开始
 
