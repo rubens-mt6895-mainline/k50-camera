@@ -59,8 +59,9 @@ GC02M1 ─ port 3 ─▶ intf 6 ─┘
 - **曝光/白平衡/对焦**：AE 用对数半步 + IIR（不呼吸）；灰世界 AWB；对比度 AF（度量为"绝对亮度差之和 ÷
   亮度和 ×1000"，不再随曝光饱和），只有主摄有马达（DW9800V @ `0x0c`）。
 - **没有 ISP**：去马赛克、AE/AWB/AF、色彩全部在 CPU 侧完成（见 `docs/ISP_FEASIBILITY.md`）。
-- **已知边界**：`custom4` 8000×6000 需要 60 MB/帧、超出 CMA 池；`custom5` 是非 binning 的 4-cell CFA，
-  转换器未支持。滚动快门是传感器读出时间的物理事实（4000×3000 约 27 ms、1080p 约 4 ms）。
+- **已知边界**：`custom4` 8000×6000 一帧 **72 MB**（12-bit `hsize*vsize*3/2`；早期写 60 MB 是 RAW10 口径），
+  超出 32 MiB 的 CMA 池；`custom5` **已收录**（读回来是 period-2 Bayer，bin 2 → 2000×1500、bin 1 → 4000×3000）。
+  滚动快门是传感器读出时间的物理事实（4000×3000 约 27 ms、1080p 约 4 ms）。
 
 ## IMX582 模式表（vendor 表，本机实测）
 
@@ -71,12 +72,13 @@ GC02M1 ─ port 3 ─▶ intf 6 ─┘
 | `custom3` | 4000×2256 | 4592×2560 | 705.6 MHz | 60.02 | 同上，60 fps |
 | `custom2` | 1920×1080 | 2912×2100 | 734.4 MHz | 120.09 | 1920×1080 / 960×540 |
 | `hs_video` | 1920×1080 | 2912×1236 | 864 MHz | 240.05 | 1920×1080 / 960×540 |
-| `custom4` | 8000×6000 | 9184×6271 | 864 MHz | 15.00 | 未收录（超出 CMA） |
-| `custom5` | 4000×3000（1:1） | 9184×3135 | 864 MHz | 30.01 | 未收录（4-cell CFA） |
+| `custom4` | 8000×6000 | 9184×6271 | 864 MHz | 15.00 | 未收录（一帧 72 MB，超出 32 MiB CMA） |
+| `custom5` | 4000×3000 | 9184×3135 | 864 MHz | 30.01 | **已收录**：bin 2 → 2000×1500、bin 1 → 4000×3000 |
 
 像素时钟规则（IMX586 标定表与 IMX582 实测双重验证）：`pclk = 4.8 MHz × ((0x0306<<8)|0x0307)`、
 `fps = pclk / (HTS × VTS)`。`capture` / `slim_video` / `custom1` / `custom6` 四张表在这份 rubens
-vendor 驱动里是空的。每个模式的寄存器表在 `modes/mode_<name>.txt`。
+vendor 驱动里是空的。每个模式的寄存器表在 `out/modes/mode_<name>.txt`（`scripts/gen_mode_table.py` 从
+vendor 头文件导出；仓库里只有 `out/modes/`，没有 `modes/`）。
 
 ## 快速开始
 
@@ -110,7 +112,7 @@ sh scripts/zz_front_cap.sh                           # 前摄 IMX596 上电（�
   并打印原因（2026-10-09 一次整机死锁的教训，见 `docs/V4L2_CAMERA.md` §25）；要切回主摄先跑
   `echo mode <name> > /proc/camcap`。
 - 辅助相机的上电/寄存器表是**用户态**完成的，驱动不会去碰它们的 I²C。
-- `hs_video` 240 fps 模式打不满（182 fps）；`custom4`/`custom5` 未收录。
+- `hs_video` 240 fps 模式打不满（182 fps）；`custom4` 未收录（一帧 72 MB，超出 32 MiB CMA）：`custom5` 已收录。
 - 暗光下高帧率只能靠增益（曝光被 VTS 限制），会有噪声。
 
 ## 来源与许可

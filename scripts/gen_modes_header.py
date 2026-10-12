@@ -27,13 +27,21 @@ SUPPORTED = {
     "custom3":       ("custom3",      0,    "4000x2256 at 60 fps, table VTS"),
     "custom2":       ("custom2",      0,    "1920x1080 at 120 fps, table VTS"),
     "hs_video":      ("hs_video",     0,    "1920x1080 at 240 fps, table VTS"),
+    "custom5":       ("custom5",      0,    "4000x3000 readout without on-sensor binning, table "
+                                            "VTS; the raw is still a period-2 Bayer image "
+                                            "(measured 2026-10-10), so the normal converters "
+                                            "apply -- bin 2 gives 2000x1500, bin 1 the full "
+                                            "4000x3000"),
 }
 
-# deliberately not exposed: custom4 is 8000x6000 (60 MB per frame, three times
-# the CMA pool) and custom5 is a non-binned 4-cell readout whose CFA layout the
-# converter does not handle yet.  Both can still be brought up by hand with the
-# exp_hsize/exp_vsize module parameters.
-EXCLUDED = {"custom4", "custom5"}
+# deliberately not exposed: custom4 is 8000x6000, i.e. 72 MB per frame (hsize *
+# vsize * 3 / 2) against a 32 MiB CMA pool, and it would also raise
+# CAMCAP_IMX582_MAX_FRAME from 18 000 000 to 72 000 000, which makes
+# cam_cap_init() request a 72 MB buffer and fall back through the halving path
+# (dma_alloc_coherent want >>= 1) for *every* mode.  It needs a bigger cma=
+# bootarg plus that sizing fix; until then it can still be brought up by hand
+# with the exp_hsize/exp_vsize module parameters.
+EXCLUDED = {"custom4"}
 
 # The receiver's timing follows the sensor's link rate.  These are the vendor
 # constants from isp71_ref (mtk_cam-seninf-hw_phy_3_0.c) that port2_rx71.py

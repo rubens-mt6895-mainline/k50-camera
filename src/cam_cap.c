@@ -829,9 +829,39 @@ static int out_contrast = 128;		/* 0..255, 128 = 1.0x around mid grey */
 module_param(out_contrast, int, 0644);
 MODULE_PARM_DESC(out_contrast, "contrast around mid grey, 128 = 1.0x (default 128)");
 
-static int out_saturation = 128;	/* 0..255, 128 = 1.0x chroma */
+static int out_saturation = 128;	/* 0..384, 128 = 1.0x chroma */
 module_param(out_saturation, int, 0644);
-MODULE_PARM_DESC(out_saturation, "chroma gain, 128 = 1.0x (default 128)");
+MODULE_PARM_DESC(out_saturation, "chroma gain, 128 = 1.0x (default 128, up to 384 = 3.0x)");
+
+/*
+ * The same three knobs for the auxiliary cameras, which have no colour
+ * processing of their own: no tone curve, no colour matrix, and no AE (their
+ * exposure is the static value in their table).  Measured 2026-10-11 with all
+ * four cameras on the same figure (docs/V4L2_CAMERA.md 34): mean HSV saturation
+ * 0.26 on the main sensor against 0.18 / 0.16 for the ultrawide and macro and
+ * 0.07 for the front.  Boost the chroma for those boards only: measured on the
+ * macro, aux_saturation 128 -> 192 moves the mean chroma from 2.29 to 3.09 and
+ * 256 to 4.35, while the luma stays at 21.4.
+ *
+ * The contrast knob stays at 1.0x on purpose.  cam_lut_build() pivots contrast
+ * around mid grey (2048 of the 12 bit range), so 1.125x already clamps every
+ * value below 228 to black; the auxiliary sensors sit far below that (the macro
+ * frame only spans 248..530 raw, i.e. 0..282 above the pedestal) and the 144
+ * default turned the macro into an all black frame -- measured 2026-10-11,
+ * luma mean 0.0 against 21.4 with the neutral value.  Use it only with the
+ * brightness knob and only on a camera whose raw reaches mid grey.
+ */
+static int aux_brightness;		/* -128..128, added after the pre-gain */
+module_param(aux_brightness, int, 0644);
+MODULE_PARM_DESC(aux_brightness, "brightness offset for the auxiliary cameras, -128..128 (default 0)");
+
+static int aux_contrast = 128;		/* 0..255, 128 = 1.0x around mid grey */
+module_param(aux_contrast, int, 0644);
+MODULE_PARM_DESC(aux_contrast, "contrast around mid grey for the auxiliary cameras, 128 = 1.0x (default 128, values above it crush the dark auxiliary frames)");
+
+static int aux_saturation = 192;	/* 0..384, 128 = 1.0x chroma */
+module_param(aux_saturation, int, 0644);
+MODULE_PARM_DESC(aux_saturation, "chroma gain for the auxiliary cameras, 128 = 1.0x (default 192 = 1.5x)");
 
 /*
  * ------------------------------------------------------------------
@@ -2562,6 +2592,9 @@ struct cam_v4l2_ctx {
 	struct v4l2_ctrl	*ct_dgain;	/* V4L2_CID_DIGITAL_GAIN */
 	struct v4l2_ctrl	*ct_focus;	/* V4L2_CID_FOCUS_ABSOLUTE */
 	struct v4l2_ctrl	*ct_focus_auto;	/* V4L2_CID_FOCUS_AUTO */
+	struct v4l2_ctrl	*ct_brightness;	/* V4L2_CID_BRIGHTNESS */
+	struct v4l2_ctrl	*ct_contrast;	/* V4L2_CID_CONTRAST */
+	struct v4l2_ctrl	*ct_saturation;	/* V4L2_CID_SATURATION */
 	unsigned int		dgain;		/* sensor 0x020e, AE-steered */
 };
 
@@ -2620,32 +2653,55 @@ static struct cam_sensor_mode cam_aux_modes[CAMCAP_MAX_CAM] = {
 	},
 };
 
+/*
+ * The three auxiliary cameras are brought up from userspace, so this driver
+ * never writes their sensors (see cam_sensor_apply()).  AWB is the exception
+ * it is safe to make: it only moves the host-side WB LUTs.  Their CFA phase
+ * was measured on 2026-10-11 and all three read out period-2 RGGB once the
+ * ultrawide's table got its hflip (docs/V4L2_CAMERA.md 30), so the same
+ * grey-world loop the main sensor uses can run on their frames.  AE stays off:
+ * that one *does* write 0x0202/0x0204, which mean something else on these
+ * sensors - their exposure comes from the static values in their tables.
+ */
 static struct cam_board cam_boards[CAMCAP_MAX_CAM] = {
+	/*
+	 * The card string is what userspace sees as the camera name: GStreamer's
+	 * v4l2 device provider copies it into the device display name and Cheese
+	 * shows that in its camera chooser.  V4L2 also truncates it at 32 bytes.
+	 * The old "MT6895 CAMSV1 (...)" form made all four nodes share their first
+	 * 19 characters - and the ultrawide's 39-character name lost its closing
+	 * bracket - so the chooser listed four entries that looked identical.
+	 * Sensor first, role second, CSI receiver last: distinct from byte 0, and
+	 * everything fits well inside the limit.
+	 */
 	{
 		.name = "IMX582",
-		.card = "MT6895 CAMSV1 (IMX582)",
+		.card = "IMX582 main (CAMSV1)",
 		.sensor_drv = true, .ae = true, .awb = true, .af = true,
 		.modes = cam_imx582_modes, .nmodes = CAMCAP_IMX582_NMODES,
 	},
 	{
 		.name = "IMX596",
-		.card = "MT6895 CAMSV1 (IMX596 front)",
+		.card = "IMX596 front (CAMSV1)",
 		.route_intf = 0, .hsize = 2592, .vsize = 1952,
 		.fps_x100 = 3000, .exp_max = 1900,
+		.awb = true,
 		.modes = &cam_aux_modes[1], .nmodes = 1,
 	},
 	{
 		.name = "S5K4H7",
-		.card = "MT6895 CAMSV1 (S5K4H7 ultrawide)",
+		.card = "S5K4H7 ultrawide (CAMSV1)",
 		.route_intf = 2, .hsize = 3264, .vsize = 2448,
 		.fps_x100 = 3000, .exp_max = 2400,
+		.awb = true,
 		.modes = &cam_aux_modes[2], .nmodes = 1,
 	},
 	{
 		.name = "GC02M1",
-		.card = "MT6895 CAMSV1 (GC02M1 macro)",
+		.card = "GC02M1 macro (CAMSV1)",
 		.route_intf = 6, .hsize = 1600, .vsize = 1200,
 		.fps_x100 = 3000, .exp_max = 1150,
+		.awb = true,
 		.modes = &cam_aux_modes[3], .nmodes = 1,
 	},
 };
@@ -2692,6 +2748,58 @@ static unsigned int cam_engine_hsize;
 static unsigned int cam_engine_vsize;
 static unsigned int cam_engine_out_w;
 static unsigned int cam_engine_out_h;
+
+/*
+ * The output-stage knobs (brightness/contrast/saturation) are per board: the
+ * auxiliary cameras have no colour processing in their own pipeline, so they
+ * carry their own values (see aux_contrast/aux_saturation above).  Everything
+ * that builds or reads them goes through these three helpers, which answer for
+ * whichever board the engine is set up for.
+ */
+static bool cam_aux_active(void)
+{
+	return cam_active != &cam_boards[0];
+}
+
+static int cam_out_brightness(void)
+{
+	return cam_aux_active() ? aux_brightness : out_brightness;
+}
+
+static int cam_out_contrast(void)
+{
+	return cam_aux_active() ? aux_contrast : out_contrast;
+}
+
+static int cam_out_saturation(void)
+{
+	return cam_aux_active() ? aux_saturation : out_saturation;
+}
+
+/*
+ * Show the board that is streaming in the shared brightness/contrast/saturation
+ * controls.  There is one control handler for all four nodes, so without this an
+ * application reading the controls while the ultrawide streams would see the
+ * main camera's values - and write them straight back, replacing the auxiliary
+ * defaults with the main camera's.
+ */
+static void cam_out_sync_ctrls(void)
+{
+	if (!cam_v4l2)
+		return;
+	if (cam_v4l2->ct_brightness)
+		v4l2_ctrl_s_ctrl(cam_v4l2->ct_brightness, cam_out_brightness());
+	if (cam_v4l2->ct_contrast)
+		v4l2_ctrl_s_ctrl(cam_v4l2->ct_contrast, cam_out_contrast());
+	if (cam_v4l2->ct_saturation)
+		v4l2_ctrl_s_ctrl(cam_v4l2->ct_saturation, cam_out_saturation());
+}
+
+/*
+ * Set by the control callbacks and whenever the board or the white balance
+ * changes; the capture thread rebuilds the tables before the next frame.
+ */
+static bool cam_lut_dirty = true;
 
 /* the board a file handle belongs to */
 static const struct cam_board *cam_board_of(struct file *file)
@@ -2762,6 +2870,10 @@ static void cam_board_select(const struct cam_board *b)
 		exp_hsize = b->hsize;
 		exp_vsize = b->vsize;
 	}
+	/* brightness/contrast are baked into the LUTs, and both they and the
+	 * saturation gain are per board: rebuild and re-publish for this one. */
+	WRITE_ONCE(cam_lut_dirty, true);
+	cam_out_sync_ctrls();
 }
 
 /* remember what node 0 runs, so a later start can put the engine back on it */
@@ -2899,9 +3011,11 @@ static u8 cam_lut_b[4096];
 static void cam_lut_build(u8 *lut, unsigned int wb_q8)
 {
 	unsigned int v;
-	int con = out_contrast < 0 ? 0 : (out_contrast > 255 ? 255 : out_contrast);
-	int bri = out_brightness < -128 ? -128 :
-		  (out_brightness > 128 ? 128 : out_brightness);
+	int con = cam_out_contrast();
+	int bri = cam_out_brightness();
+
+	con = con < 0 ? 0 : (con > 255 ? 255 : con);
+	bri = bri < -128 ? -128 : (bri > 128 ? 128 : bri);
 
 	for (v = 0; v < 4096; v++) {
 		u32 n, x, y;
@@ -2929,9 +3043,6 @@ static void cam_lut_build(u8 *lut, unsigned int wb_q8)
 		lut[v] = y > 255 ? 255 : (u8)y;
 	}
 }
-
-/* Set by the control callbacks; the capture thread does the real work. */
-static bool cam_lut_dirty = true;
 
 /* Rebuild all three tables from the current white balance and output knobs. */
 static void cam_lut_rebuild(void)
@@ -3358,9 +3469,9 @@ MODULE_PARM_DESC(af_trace, "log every autofocus measurement (default 1)");
  * whichever sample noise favoured.  A lit room reads several hundred, a flat
  * dark frame 0..2.  Set to 0 to trust every sample (the old behaviour).
  */
-static unsigned int af_floor = 20;
+static unsigned int af_floor = 0;
 module_param(af_floor, uint, 0644);
-MODULE_PARM_DESC(af_floor, "focus metric below which a sample carries no information, in contrast per mille (default 20, 0 = trust every sample)");
+MODULE_PARM_DESC(af_floor, "focus metric below which a sample carries no information, in contrast per mille (default 0 = trust every sample)");
 
 /*
  * Where to leave the lens when a scan finds no evidence and there is no
@@ -3784,14 +3895,30 @@ static void cam_af_step(const struct cam_stats *st)
 
 	if (cam_af.state == CAM_AF_HOLD) {
 		cam_af.hold_metric = m;
-		if (m < af_floor) {
+		if (!m) {
 			/*
-			 * Nothing measurable in this frame (dark or flat
-			 * scene): do not wobble -- a flat scene would walk the
-			 * lens on noise -- and do not keep searching either.
-			 * Stay where the last scan left the lens until the
-			 * scene gives the metric something to bite on; the
-			 * branch below starts a scan again then.
+			 * Nothing measurable in this frame at all.  The metric
+			 * is 0 only when the mean sampled level is under
+			 * CAMCAP_AF_MIN_LEVEL, i.e. a dark frame with no
+			 * texture to bite on: do not wobble -- that would walk
+			 * the lens on noise -- and do not keep searching
+			 * either.  Stay where the last scan left the lens until
+			 * the scene comes back; the branch below starts a scan
+			 * again then.
+			 *
+			 * 2026-10-10: this test used to be `m < af_floor` with
+			 * af_floor=20, which latched flat on every normally lit
+			 * indoor scene.  Measured that night, with the lamp on
+			 * and a textured scene, the metric was 10..12 per mille
+			 * at every one of 17 VCM positions (0..1023), so the
+			 * whole search was declared "no contrast" and the lens
+			 * was abandoned wherever the failed scan had left it
+			 * (1023, the least sharp end): "it focuses but the
+			 * picture is still blurry".  With the floor out of the
+			 * way the same scene selects pos=384, which is exactly
+			 * where an independent image-side measurement (4-neigh-
+			 * bour Laplacian energy and Tenengrad on the captured
+			 * frames) puts the focus peak: 41.9 vs 32.9.
 			 */
 			cam_af.hold_frames = 0;
 			cam_af.low = 0;
@@ -3955,7 +4082,7 @@ static void cam_af_step(const struct cam_stats *st)
 	cam_af.state = CAM_AF_HOLD;
 	cam_af.hold_frames = 0;
 	cam_af.low = 0;
-	if (cam_af.best_metric < af_floor) {
+	if (!cam_af.best_metric) {
 		/*
 		 * No position produced a metric worth acting on (dark or
 		 * textureless scene).  Put the lens back where this scan found
@@ -3967,8 +4094,8 @@ static void cam_af_step(const struct cam_stats *st)
 		cam_af.best_pos = cam_af.hold_pos;
 		cam_af.hold_metric = m;
 		cam_vcm_set(cam_af.hold_pos);
-		pr_info("cam_af: scan %u found no contrast (metric %u < %u), lens back to %u\n",
-			cam_af.scans, m, af_floor, cam_af.hold_pos);
+		pr_info("cam_af: scan %u found no contrast (metric %u), lens back to %u\n",
+			cam_af.scans, m, cam_af.hold_pos);
 		return;
 	}
 	if (cam_af.metric_before * 110 < cam_af.best_metric * 100)
@@ -4340,9 +4467,9 @@ static void cam_isp_governor(const struct cam_stats *in)
 
 	/*
 	 * Grey world: drive the corrected channel means towards each other.
-	 * The auxiliary cameras are left alone: the CFA phase of those sensors
-	 * is not known here, and the userspace bring-up that produced the
-	 * verified frames ran them with AWB off.
+	 * The aux boards carry .awb = true as well now that their CFA phase is
+	 * known (all three period-2 RGGB, see cam_boards[]); the loop is pure
+	 * host side, so it is safe for cameras this driver never writes.
 	 */
 	if (cam_awb_auto && cam_active->awb && st.mean_g >= awb_min_level &&
 	    st.mean_r && st.mean_b) {
@@ -4513,13 +4640,19 @@ static inline u8 cam_u8_clamp(int v)
  * cyan comes out gold" was: a pure Cb/Cr exchange, which the grey-world AWB
  * cannot see because it mirrors every gain.
  *
+ * `mirror` is the same 180 degree flip dropped by the caller for an auxiliary
+ * camera that comes out mirrored (see out_mirror): the pair then keeps the
+ * readout order, because a 180 degree rotation reverses both the group order
+ * and the two pixels inside a group.
+ *
  * r/g/b are raw 12-bit samples.  Averages have to happen before the tables,
  * because the tables end in a square-root gamma: averaging after them would
  * lift the peaks.
  */
 static inline void cam_yuyv_pair(u8 *q, u32 r0, u32 g0, u32 b0,
 				 u32 r1, u32 g1, u32 b1, int sat,
-				 const u8 *lut_ee, const u8 *lut_oo)
+				 const u8 *lut_ee, const u8 *lut_oo,
+				 bool mirror)
 {
 	const int ya = rb_swap ? 29 : 77;	/* (0,0) tap -> luma */
 	const int yb = rb_swap ? 77 : 29;	/* (1,1) tap -> luma */
@@ -4548,9 +4681,9 @@ static inline void cam_yuyv_pair(u8 *q, u32 r0, u32 g0, u32 b0,
 		v = ((v - 128) * sat) / 128 + 128;
 	}
 
-	q[0] = cam_u8_clamp(ly1);
+	q[0] = cam_u8_clamp(mirror ? ly0 : ly1);
 	q[1] = cam_u8_clamp(u);
-	q[2] = cam_u8_clamp(ly0);
+	q[2] = cam_u8_clamp(mirror ? ly1 : ly0);
 	q[3] = cam_u8_clamp(v);
 }
 
@@ -4588,7 +4721,56 @@ static inline int cam_metric_px(u32 g)
  *
  * Row y of the output is raw row y, with the flip done by writing the rows in
  * reverse, so a row only needs its two vertical neighbours.
+ *
+ * Orientation of the auxiliary outputs, 2026-10-11: in Kamoso the three
+ * auxiliary cameras (IMX596, S5K4H7, GC02M1) all came out mirrored left to
+ * right while IMX582 was correct.  For S5K4H7 part of that is ours: its
+ * bring-up table has to set 0x0101=1, because that flip turns the sensor's
+ * GRBG output into the RGGB phase the converters assume, and the same flip
+ * mirrors the picture.  The main camera is never flipped.
+ *
+ * The same afternoon settled what the mirror actually is: with out_mirror
+ * alone the picture came out upside down, i.e. the three auxiliary readouts sit
+ * rotated 180 degrees against the main camera, not mirrored on one axis.  Both
+ * halves therefore default to all three boards -- with out_mirror only, the
+ * left-right error is hidden and the vertical one shows.
+ *
+ * 2026-10-11 evening, after the user looked at the 7/7 build in Kamoso: IMX596
+ * and S5K4H7 then came out left-right mirrored while GC02M1 was right, so those
+ * two get the vertical half only.  out_mirror therefore defaults to bit 2 alone
+ * (GC02M1); front and ultrawide keep just out_flip_v.  Per board that is
+ * 0/1 = front, 0/1 = ultrawide, 1/1 = macro, i.e. out_mirror = 4,
+ * out_flip_v = 7.  Both stay reachable from sysfs, and /root/zz_orient.sh sets
+ * any of the four combinations for one board live.
+ *
+ * One bit per auxiliary board -- bit 0 = IMX596 (/dev/video1), 1 = S5K4H7
+ * (video2), 2 = GC02M1 (video3).  out_mirror takes the mirror back out by
+ * writing the 4-byte groups of a row in the other direction, out_flip_v does
+ * the same for the vertical half of the 180 degree rotation.  Both are read
+ * once per conversion, so they can be changed from
+ * /sys/module/cam_cap/parameters/ and apply to the next converted frame: no
+ * rebuild, and the sensor registers never move.
  */
+static unsigned int out_mirror = 4;
+module_param(out_mirror, uint, 0644);
+MODULE_PARM_DESC(out_mirror,
+		 "mirror the auxiliary cameras left to right (one bit per auxiliary board; default 4 = GC02M1 only, measured 2026-10-11)");
+static unsigned int out_flip_v = 7;
+module_param(out_flip_v, uint, 0644);
+MODULE_PARM_DESC(out_flip_v,
+		 "flip the auxiliary cameras top to bottom (one bit per auxiliary board; default 7 = all three, measured 2026-10-11: the auxiliary readout is rotated 180 degrees against the main camera)");
+
+/* Is the bit of `which` that belongs to the board streaming now set? */
+static bool cam_aux_flip(unsigned int which)
+{
+	unsigned int idx = (unsigned int)(cam_active - cam_boards);
+
+	if (idx == 0 || idx >= CAMCAP_MAX_CAM)
+		return false;
+
+	return !!(which & BIT(idx - 1));
+}
+
 static void cam_v4l2_convert_full_ref(const u8 *src, u8 *dst, unsigned int first,
 				      unsigned int last, struct cam_stats *acc)
 {
@@ -4598,7 +4780,7 @@ static void cam_v4l2_convert_full_ref(const u8 *src, u8 *dst, unsigned int first
 	const unsigned int stride = cam_src_stride;
 	const unsigned int rw = cam_src_w;
 	const unsigned int rh = cam_src_h;
-	int sat = cam_clamp_int(out_saturation, 0, 255);
+	int sat = cam_clamp_int(cam_out_saturation(), 0, 384);
 	unsigned int y, x;
 	u64 sum_r = 0, sum_g = 0, sum_b = 0;
 	unsigned int count = 0, clip = 0, dark = 0;
@@ -4607,12 +4789,14 @@ static void cam_v4l2_convert_full_ref(const u8 *src, u8 *dst, unsigned int first
 	/* same tap-to-colour switch as the 2x2 path, see there */
 	const u8 *lut_ee = rb_swap ? cam_lut_b : cam_lut_r;	/* (0,0) tap */
 	const u8 *lut_oo = rb_swap ? cam_lut_r : cam_lut_b;	/* (1,1) tap */
+	const bool mirror_x = cam_aux_flip(out_mirror);
+	const bool mirror_y = cam_aux_flip(out_flip_v);
 
 	for (y = first; y < last; y++) {
 		const u8 *l0 = src + (size_t)y * stride;
 		const u8 *lm = src + (size_t)(y ? y - 1 : 0) * stride;
 		const u8 *lp = src + (size_t)(y + 1 < rh ? y + 1 : y) * stride;
-		u8 *o = dst + (size_t)(H - 1 - y) * W * 2;
+		u8 *o = dst + (size_t)(mirror_y ? y : (H - 1 - y)) * W * 2;
 		/*
 		 * Measure on row *pairs*.  A raw row is either R/Gr or Gb/B,
 		 * so gating on y alone samples one parity only: the red sum
@@ -4624,12 +4808,13 @@ static void cam_v4l2_convert_full_ref(const u8 *src, u8 *dst, unsigned int first
 
 		for (x = 0; x + 1 < W; x += 2) {
 			u32 r0, g0, b0, r1, g1, b1;
-			u8 *q = o + (size_t)(n - 1 - (x >> 1)) * 4;
+			u8 *q = o + (size_t)(mirror_x ? (x >> 1) :
+					     (n - 1 - (x >> 1))) * 4;
 
 			cam_bayer_px(lm, l0, lp, x, y, rw, &r0, &g0, &b0);
 			cam_bayer_px(lm, l0, lp, x + 1, y, rw, &r1, &g1, &b1);
 			cam_yuyv_pair(q, r0, g0, b0, r1, g1, b1, sat,
-				      lut_ee, lut_oo);
+				      lut_ee, lut_oo, mirror_x);
 
 			if (!st_on)
 				continue;
@@ -4753,7 +4938,7 @@ static void cam_v4l2_convert_full_fast(const u8 *src, u8 *dst,
 	const unsigned int stride = cam_src_stride;
 	const unsigned int rw = cam_src_w;
 	const unsigned int rh = cam_src_h;
-	int sat = cam_clamp_int(out_saturation, 0, 255);
+	int sat = cam_clamp_int(cam_out_saturation(), 0, 384);
 	u16 *rows = scratch, *lm, *l0, *lp, *tmp;
 	bool owned = false;
 	unsigned int y, x;
@@ -4764,6 +4949,8 @@ static void cam_v4l2_convert_full_fast(const u8 *src, u8 *dst,
 	/* same tap-to-colour switch as the 2x2 path, see there */
 	const u8 *lut_ee = rb_swap ? cam_lut_b : cam_lut_r;	/* (0,0) tap */
 	const u8 *lut_oo = rb_swap ? cam_lut_r : cam_lut_b;	/* (1,1) tap */
+	const bool mirror_x = cam_aux_flip(out_mirror);
+	const bool mirror_y = cam_aux_flip(out_flip_v);
 
 	/*
 	 * The row window normally comes from the worker (allocated once per
@@ -4787,19 +4974,20 @@ static void cam_v4l2_convert_full_fast(const u8 *src, u8 *dst,
 	cam_unpack_row_pad(src + (size_t)first * stride, l0, rw);
 
 	for (y = first; y < last; y++) {
-		u8 *o = dst + (size_t)(H - 1 - y) * W * 2;
+		u8 *o = dst + (size_t)(mirror_y ? y : (H - 1 - y)) * W * 2;
 		bool st_on = !((y >> 1) & (CAMCAP_STATS_ROW_STEP - 1));
 		unsigned int nx = y + 1 < rh ? y + 1 : y;
 		/*
 		 * The output is rotated 180 degrees, so the row is written from
 		 * the last column group backwards: one decrementing pointer
-		 * instead of a multiply per group.
+		 * instead of a multiply per group.  An auxiliary camera whose
+		 * picture comes out mirrored writes it forwards instead.
 		 */
-		u8 *q = o + (size_t)(n - 1) * 4;
+		u8 *q = mirror_x ? o : o + (size_t)(n - 1) * 4;
 
 		cam_unpack_row_pad(src + (size_t)nx * stride, lp, rw);
 
-		for (x = 0; x + 1 < W; x += 2, q -= 4) {
+		for (x = 0; x + 1 < W; x += 2, q += mirror_x ? 4 : -4) {
 			unsigned int xp = x + 2;
 			u32 r0, g0, b0, r1, g1, b1;
 
@@ -4822,7 +5010,7 @@ static void cam_v4l2_convert_full_fast(const u8 *src, u8 *dst,
 				r1 = (lm[x + 1] + lm[x + 3] + lp[x + 1] + lp[x + 3]) >> 2;
 			}
 			cam_yuyv_pair(q, r0, g0, b0, r1, g1, b1, sat,
-				      lut_ee, lut_oo);
+				      lut_ee, lut_oo, mirror_x);
 
 			if (!st_on)
 				continue;
@@ -4910,7 +5098,7 @@ static void cam_v4l2_convert_band(const u8 *src, u8 *dst, unsigned int first,
 		return;
 	}
 	const unsigned int stride = cam_src_stride;	/* raw bytes per line */
-	int sat = cam_clamp_int(out_saturation, 0, 255);
+	int sat = cam_clamp_int(cam_out_saturation(), 0, 384);
 	unsigned int y, x;
 	u64 sum_r = 0, sum_g = 0, sum_b = 0;
 	unsigned int count = 0, clip = 0, dark = 0;
@@ -4932,11 +5120,13 @@ static void cam_v4l2_convert_band(const u8 *src, u8 *dst, unsigned int first,
 	const int ub = rb_swap ? -43 : 128;
 	const int va = rb_swap ? -21 : 128;
 	const int vb = rb_swap ? 128 : -21;
+	const bool mirror_x = cam_aux_flip(out_mirror);
+	const bool mirror_y = cam_aux_flip(out_flip_v);
 
 	for (y = first; y < last; y++) {
 		const u8 *l0 = src + (size_t)(y * CAMCAP_BIN) * stride;
 		const u8 *l1 = l0 + stride;
-		u8 *o = dst + (size_t)(H - 1 - y) * W * 2;
+		u8 *o = dst + (size_t)(mirror_y ? y : (H - 1 - y)) * W * 2;
 		bool st_on = !(y & (CAMCAP_STATS_ROW_STEP - 1));
 
 		for (x = 0; x < W; x += 2) {
@@ -4960,7 +5150,8 @@ static void cam_v4l2_convert_band(const u8 *src, u8 *dst, unsigned int first,
 			int u1 = ((ua * a1 - 85 * g1 + ub * d1) >> 8) + 128;
 			int v0 = ((va * a0 - 107 * g0 + vb * d0) >> 8) + 128;
 			int v1 = ((va * a1 - 107 * g1 + vb * d1) >> 8) + 128;
-			u8 *q = o + (size_t)(n - 1 - (x >> 1)) * 4;
+			u8 *q = o + (size_t)(mirror_x ? (x >> 1) :
+					     (n - 1 - (x >> 1))) * 4;
 
 			/* chroma gain around 128, then clamp to byte range */
 			u0 = ((u0 - 128) * sat) / 128 + 128;
@@ -4981,9 +5172,9 @@ static void cam_v4l2_convert_band(const u8 *src, u8 *dst, unsigned int first,
 			 * gold" was: a pure Cb/Cr exchange, which the grey-world
 			 * AWB cannot see because it mirrors every gain.
 			 */
-			q[0] = cam_u8_clamp(ly1);
+			q[0] = cam_u8_clamp(mirror_x ? ly0 : ly1);
 			q[1] = cam_u8_clamp((u0 + u1) >> 1);
-			q[2] = cam_u8_clamp(ly0);
+			q[2] = cam_u8_clamp(mirror_x ? ly1 : ly0);
 			q[3] = cam_u8_clamp((v0 + v1) >> 1);
 
 			if (!st_on)
@@ -5690,6 +5881,26 @@ static void cam_v4l2_finish_slot(struct cam_v4l2_ctx *c, struct cam_slot *s)
 		return;
 
 	/*
+	 * Last line of defence: the converter writes out_width * out_height *
+	 * 2 bytes, and these buffers are vmalloc()ed, so a buffer that is too
+	 * small is an oops on an unmapped page rather than a short write.  The
+	 * geometry cannot change while a stream is running (s_fmt and the mode
+	 * command both refuse while the engine is busy), so reaching this means
+	 * an application re-requeued its buffers with sizes that no longer
+	 * match - drop the frame and say so instead of taking the kernel down.
+	 */
+	if (vb2_plane_size(&buf->vb.vb2_buf, 0) <
+	    (size_t)out_width * out_height * 2) {
+		pr_err_ratelimited("v4l2: buffer has %lu bytes but %ux%u needs %u, dropping frame\n",
+				   (unsigned long)vb2_plane_size(&buf->vb.vb2_buf,
+								 0),
+				   out_width, out_height,
+				   out_width * out_height * 2);
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+		return;
+	}
+
+	/*
 	 * Whatever the CPU still holds for this slot's lines is from the
 	 * previous frame: drop it before reading the new one.  With the
 	 * parallel pool each worker invalidates only its own row band instead
@@ -5937,11 +6148,66 @@ static int cam_v4l2_thread(void *arg)
 
 /* ---- vb2 queue ops ---- */
 
+/* the auxiliary node whose vb2 queue this is: NULL for node 0's queue */
+static struct cam_aux_node *cam_aux_of_queue(const struct vb2_queue *q)
+{
+	unsigned int i;
+
+	for (i = 0; i < cam_aux_count; i++)
+		if (&cam_aux[i].queue == q)
+			return &cam_aux[i];
+
+	return NULL;
+}
+
+/*
+ * How big one frame is for the queue that is asking for buffers.
+ *
+ * The engine's globals (out_width/out_height) describe the camera that is
+ * *streaming*, and an auxiliary node only takes them over in
+ * start_streaming() - which runs after reqbufs and after qbuf.  Sizing an
+ * auxiliary node's buffers from those globals therefore hands it whatever the
+ * previous camera left behind, and when the frame it produces is bigger than
+ * that, cam_v4l2_convert_band() writes past the end of the buffer.  These are
+ * vmalloc()ed buffers, so the overflow lands on an unmapped page: the
+ * converter thread takes an oops, the stream dies after one frame, and the
+ * stop_streaming() that follows oopses again in kthread_stop() on the dead
+ * thread (that is the wedge that needed a power cycle on 2026-10-10).
+ *
+ * Measured on 2026-10-11: streaming IMX596 (1296x976, 2 530 048 bytes) and
+ * then S5K4H7 (1632x1224, 3 995 136 bytes) overflowed the smaller buffers:
+ * "Unable to handle kernel paging request at virtual address ffff8000952dfffc",
+ * "pc : cam_v4l2_convert_band+0xa18/0xe9c [cam_cap]", WnR = 1.  The order
+ * uw -> front -> macro in the notes never hit it because the frames only ever
+ * get smaller that way.
+ *
+ * Node 0 therefore uses the geometry the engine remembers for it, which is
+ * exactly what cam_engine_restore() puts back at streamon, and an auxiliary
+ * node uses the format its bring-up fixed.
+ */
+static unsigned int cam_queue_frame_size(const struct vb2_queue *q)
+{
+	const struct cam_aux_node *a = cam_aux_of_queue(q);
+	unsigned int w, h;
+
+	if (a)
+		return a->pix.sizeimage;
+
+	w = cam_engine_out_w;
+	h = cam_engine_out_h;
+	if (!w || !h) {
+		w = out_width;
+		h = out_height;
+	}
+
+	return w * h * 2;
+}
+
 static int cam_vb2_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 			       unsigned int *num_planes, unsigned int sizes[],
 			       struct device *alloc_devs[])
 {
-	unsigned int size = out_width * out_height * 2;
+	unsigned int size = cam_queue_frame_size(q);
 
 	if (*num_planes) {
 		if (sizes[0] < size)
@@ -5954,12 +6220,17 @@ static int cam_vb2_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 	if (*num_buffers < 2)
 		*num_buffers = 2;
 
+	/* the measured proof that reqbufs sized for the node that asked */
+	pr_info("v4l2: reqbufs %u buffers of %u bytes (%s)\n", *num_buffers,
+		size, cam_aux_of_queue(q) ? cam_aux_of_queue(q)->board->name
+					  : cam_boards[0].name);
+
 	return 0;
 }
 
 static int cam_vb2_buf_prepare(struct vb2_buffer *vb)
 {
-	unsigned int size = out_width * out_height * 2;
+	unsigned int size = cam_queue_frame_size(vb->vb2_queue);
 
 	if (vb2_plane_size(vb, 0) < size)
 		return -EINVAL;
@@ -6016,6 +6287,15 @@ static int cam_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 			if (cam_active != &cam_boards[0]) {
 				pr_err("v4l2: node 0 refused: the engine is on %s (bring that camera's own path back, then echo mode <name> > /proc/camcap)\n",
 				       cam_active->name);
+				/*
+				 * vb2 wants every buffer it handed over back when
+				 * start_streaming() fails.  Leaving them queued
+				 * made videobuf2-core warn "leaving buffer N in
+				 * active state" on the cancel that follows (seen
+				 * 2026-10-11), and the application never got the
+				 * buffers it had queued.
+				 */
+				cam_v4l2_return_all(c, VB2_BUF_STATE_QUEUED);
 				return -EBUSY;
 			}
 			cam_engine_restore();
@@ -6227,6 +6507,19 @@ static int cam_mode_match_on(const struct cam_board *b, unsigned int w,
 					    cam_buf_size ? cam_buf_size : frame_bytes);
 			continue;
 		}
+		/*
+		 * A mode the sensor reads out without on-sensor binning has the
+		 * same output geometry as its binned twin, so a size match
+		 * cannot tell them apart: at bin 2 both custom5 (4000x3000
+		 * unbinned) and preview (4000x3000 binned) answer 2000x1500.
+		 * Such a mode is therefore reachable by name only -- the
+		 * /proc/camcap "mode <name>" command -- and is never handed out
+		 * by a format or frame-rate match.  Without this, a request for
+		 * 2000x1500 at 30 fps would land on custom5 (30.01) instead of
+		 * preview (33.26) purely because its frame rate is closer.
+		 */
+		if (!m->sensor_bin)
+			continue;
 		if (!fps_x100)
 			return i;
 
@@ -6987,16 +7280,31 @@ static int cam_ctrl_s_ctrl(struct v4l2_ctrl *ctrl)
 			WRITE_ONCE(cam_lut_dirty, true);
 		}
 		break;
+	/*
+	 * These three steer whichever board is streaming: the main camera keeps
+	 * the classic values, an auxiliary camera its own (see aux_contrast).
+	 * An application that changes the slider while looking at the
+	 * ultrawide therefore tunes the ultrawide.
+	 */
 	case V4L2_CID_BRIGHTNESS:
-		out_brightness = cam_clamp_int(v, -128, 128);
+		if (cam_aux_active())
+			aux_brightness = cam_clamp_int(v, -128, 128);
+		else
+			out_brightness = cam_clamp_int(v, -128, 128);
 		WRITE_ONCE(cam_lut_dirty, true);
 		break;
 	case V4L2_CID_CONTRAST:
-		out_contrast = cam_clamp_int(v, 0, 255);
+		if (cam_aux_active())
+			aux_contrast = cam_clamp_int(v, 0, 255);
+		else
+			out_contrast = cam_clamp_int(v, 0, 255);
 		WRITE_ONCE(cam_lut_dirty, true);
 		break;
 	case V4L2_CID_SATURATION:
-		out_saturation = cam_clamp_int(v, 0, 255);
+		if (cam_aux_active())
+			aux_saturation = cam_clamp_int(v, 0, 384);
+		else
+			out_saturation = cam_clamp_int(v, 0, 384);
 		break;
 	case V4L2_CID_FOCUS_ABSOLUTE:
 		/*
@@ -7052,12 +7360,12 @@ static int cam_ctrl_init(struct cam_v4l2_ctx *c)
 			CAMCAP_WB_MIN, CAMCAP_WB_MAX, 1, cam_wb_r_cur);
 	c->ct_blue = v4l2_ctrl_new_std(h, &cam_ctrl_ops, V4L2_CID_BLUE_BALANCE,
 			CAMCAP_WB_MIN, CAMCAP_WB_MAX, 1, cam_wb_b_cur);
-	v4l2_ctrl_new_std(h, &cam_ctrl_ops, V4L2_CID_BRIGHTNESS, -128, 128, 1,
-			out_brightness);
-	v4l2_ctrl_new_std(h, &cam_ctrl_ops, V4L2_CID_CONTRAST, 0, 255, 1,
-			out_contrast);
-	v4l2_ctrl_new_std(h, &cam_ctrl_ops, V4L2_CID_SATURATION, 0, 255, 1,
-			out_saturation);
+	c->ct_brightness = v4l2_ctrl_new_std(h, &cam_ctrl_ops,
+			V4L2_CID_BRIGHTNESS, -128, 128, 1, cam_out_brightness());
+	c->ct_contrast = v4l2_ctrl_new_std(h, &cam_ctrl_ops,
+			V4L2_CID_CONTRAST, 0, 255, 1, cam_out_contrast());
+	c->ct_saturation = v4l2_ctrl_new_std(h, &cam_ctrl_ops,
+			V4L2_CID_SATURATION, 0, 384, 1, cam_out_saturation());
 	/*
 	 * Focus.  FOCUS_ABSOLUTE is the VCM position the contrast search would
 	 * drive the lens to; the search only reads it while FOCUS_AUTO is off.
@@ -7133,7 +7441,10 @@ static int cam_v4l2_register(void)
 		goto err_v4l2;
 	}
 
-	strscpy(c->vdev.name, "cam_cap", sizeof(c->vdev.name));
+	/* Same naming rule as the auxiliary nodes (:7319): the board name, so that
+	 * /sys/class/video4linux/video0/name says which sensor it is instead of the
+	 * module name while video1..3 already say IMX596/S5K4H7/GC02M1. */
+	strscpy(c->vdev.name, cam_boards[0].name, sizeof(c->vdev.name));
 	c->vdev.v4l2_dev = &c->v4l2_dev;
 	c->vdev.fops = &cam_v4l2_fops;
 	c->vdev.ioctl_ops = &cam_v4l2_ioctl_ops;

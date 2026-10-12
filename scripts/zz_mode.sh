@@ -5,11 +5,13 @@
 #
 #   preview(4000x3000) normal_video(4000x2256) custom3(4000x2256@60)
 #   custom2(1920x1080@120) hs_video(1920x1080@240) custom4(8000x6000)
-#   custom5(4000x3000 1:1 crop)
+#   custom5(4000x3000 = the array's centre window read 1:1, a 2x zoom of preview)
 #
 # bin 2 (default) halves the sensor mode into YUYV; bin 1 keeps every raw pixel
-# and runs the full-size bilinear converter, which is only correct for the
-# binned sensor modes (0x0900=1) - i.e. everything except custom4/custom5.
+# and runs the full-size bilinear converter.  Both are correct for every mode in
+# this table, custom5 included: the raw it hands out is a plain period-2 Bayer
+# image (measured 2026-10-11, docs/V4L2_CAMERA.md 27), not the 4-cell read the
+# first notes assumed.
 #
 # extra-params is appended to the insmod parameter list verbatim, for the
 # experiments that do not deserve their own script, e.g.
